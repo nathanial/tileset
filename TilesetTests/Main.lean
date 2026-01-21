@@ -1,0 +1,383 @@
+/-
+  Tileset Tests
+-/
+import Crucible
+import Tileset
+
+-- ============================================================================
+-- TileCoord Tests
+-- ============================================================================
+
+namespace TilesetTests.Coord
+
+open Crucible
+open Tileset
+
+testSuite "TileCoord"
+
+test "parentTile gives correct quadrant" := do
+  let child : TileCoord := { x := 5, y := 7, z := 3 }
+  let parent := child.parentTile
+  parent ≡ { x := 2, y := 3, z := 2 : TileCoord }
+
+test "childTiles returns 4 children" := do
+  let parent : TileCoord := { x := 1, y := 1, z := 1 }
+  let children := parent.childTiles
+  children.size ≡ 4
+  -- All children should be at z+1
+  for child in children do
+    child.z ≡ 2
+
+test "childTiles and parentTile are inverse" := do
+  let parent : TileCoord := { x := 3, y := 5, z := 4 }
+  let children := parent.childTiles
+  -- Each child's parent should be the original parent
+  for child in children do
+    child.parentTile ≡ parent
+
+#generate_tests
+
+end TilesetTests.Coord
+
+-- ============================================================================
+-- Projection Tests
+-- ============================================================================
+
+namespace TilesetTests.Projection
+
+open Crucible
+open Tileset
+
+testSuite "Projection"
+
+test "latLonToTile at zoom 0 gives (0,0)" := do
+  let pos : LatLon := { lat := 0.0, lon := 0.0 }
+  let tile := latLonToTile pos 0
+  tile.z ≡ 0
+  tile.x ≡ 0
+  tile.y ≡ 0
+
+test "tileToLatLon for (0,0,0) gives northwest corner" := do
+  let tile : TileCoord := { x := 0, y := 0, z := 0 }
+  let pos := tileToLatLon tile
+  -- Northwest corner of world tile
+  ensure (pos.lat > 80.0) "lat should be near max latitude"
+  ensure (pos.lon == -180.0) "lon should be -180"
+
+test "round-trip preserves tile at higher zoom" := do
+  -- At higher zoom, round-trip should preserve tile
+  let originalTile : TileCoord := { x := 12345, y := 6789, z := 15 }
+  let latLon := tileToLatLon originalTile
+  let backToTile := latLonToTile latLon originalTile.z
+  backToTile ≡ originalTile
+
+test "tilesAtZoom is 2^zoom" := do
+  (tilesAtZoom 0) ≡ 1
+  (tilesAtZoom 1) ≡ 2
+  (tilesAtZoom 2) ≡ 4
+  (tilesAtZoom 10) ≡ 1024
+
+#generate_tests
+
+end TilesetTests.Projection
+
+-- ============================================================================
+-- Provider Tests
+-- ============================================================================
+
+namespace TilesetTests.Provider
+
+open Crucible
+open Tileset
+
+testSuite "TileProvider"
+
+test "tileUrl generates correct URL" := do
+  let tile : TileCoord := { x := 123, y := 456, z := 10 }
+  let url := TileProvider.cartoDarkRetina.tileUrl tile
+  shouldContainSubstr url "/10/123/456@2x.png"
+  shouldContainSubstr url "basemaps.cartocdn.com"
+
+test "tileUrl rotates subdomains" := do
+  -- Same coordinates should give same subdomain (for caching)
+  let tile1 : TileCoord := { x := 0, y := 0, z := 0 }
+  let tile2 : TileCoord := { x := 1, y := 0, z := 0 }
+  let url1 := TileProvider.openStreetMap.tileUrl tile1
+  let url2 := TileProvider.openStreetMap.tileUrl tile2
+  -- Different tiles may have different subdomains
+  shouldContainSubstr url1 "tile.openstreetmap.org"
+  shouldContainSubstr url2 "tile.openstreetmap.org"
+
+test "cacheId is filesystem-safe" := do
+  let id := TileProvider.cartoDarkRetina.cacheId
+  ensure (not (id.any (· == ' '))) "cacheId should not contain spaces"
+  ensure (not (id.any (· == '@'))) "cacheId should not contain @"
+  id ≡ "cartodb-dark-2x"
+
+test "clampZoom respects provider limits" := do
+  let provider := TileProvider.stamenWatercolor  -- maxZoom = 16
+  (provider.clampZoom 20) ≡ 16
+  (provider.clampZoom 10) ≡ 10
+  (provider.clampZoom (-1)) ≡ 0
+
+#generate_tests
+
+end TilesetTests.Provider
+
+-- ============================================================================
+-- Retry Logic Tests
+-- ============================================================================
+
+namespace TilesetTests.Retry
+
+open Crucible
+open Tileset
+
+testSuite "RetryLogic"
+
+test "initial failure has zero retry count" := do
+  let state := Retry.RetryState.initialFailure 100
+  state.retryCount ≡ 0
+  state.lastFailTime ≡ 100
+
+test "recordRetryFailure increments count" := do
+  let state := Retry.RetryState.initialFailure 100
+  let state' := state.recordRetryFailure 200
+  state'.retryCount ≡ 1
+  state'.lastFailTime ≡ 200
+
+test "isExhausted after max retries" := do
+  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
+  let state := Retry.RetryState.initialFailure 0
+    |>.recordRetryFailure 100
+    |>.recordRetryFailure 200
+    |>.recordRetryFailure 300
+  ensure (state.isExhausted config) "state should be exhausted after max retries"
+
+test "backoffDelay is exponential" := do
+  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
+  let s0 := Retry.RetryState.initialFailure 0
+  let s1 := s0.recordRetryFailure 100
+  let s2 := s1.recordRetryFailure 200
+  (s0.backoffDelay config) ≡ 60   -- 60 * 2^0
+  (s1.backoffDelay config) ≡ 120  -- 60 * 2^1
+  (s2.backoffDelay config) ≡ 240  -- 60 * 2^2
+
+test "shouldRetry respects backoff timing" := do
+  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
+  let state := Retry.RetryState.initialFailure 100
+  -- At time 150 (only 50 frames later), should not retry yet
+  ensure (not (state.shouldRetry config 150)) "should not retry before backoff"
+  -- At time 160 (60 frames later), should retry
+  ensure (state.shouldRetry config 160) "should retry after backoff"
+
+#generate_tests
+
+end TilesetTests.Retry
+
+-- ============================================================================
+-- Viewport Tests
+-- ============================================================================
+
+namespace TilesetTests.Viewport
+
+open Crucible
+open Tileset
+
+testSuite "Viewport"
+
+test "visibleTiles returns non-empty list" := do
+  let vp : MapViewport := {
+    centerLat := 37.7749
+    centerLon := -122.4194
+    zoom := 12
+    screenWidth := 1920
+    screenHeight := 1080
+    tileSize := 512
+  }
+  let tiles := vp.visibleTiles
+  ensure (tiles.length > 0) "tiles should be non-empty"
+  -- All tiles should be at the viewport's zoom level
+  for tile in tiles do
+    tile.z ≡ 12
+
+test "visibleTilesWithBuffer returns more tiles" := do
+  let vp : MapViewport := {
+    centerLat := 0.0
+    centerLon := 0.0
+    zoom := 5
+    screenWidth := 800
+    screenHeight := 600
+    tileSize := 256
+  }
+  let base := vp.visibleTiles
+  let buffered := vp.visibleTilesWithBuffer 2
+  ensure (buffered.length > base.length) "buffered tiles should be more than base"
+
+test "visibleTileSet creates HashSet" := do
+  let vp : MapViewport := {
+    centerLat := 0.0
+    centerLon := 0.0
+    zoom := 3
+    screenWidth := 512
+    screenHeight := 512
+    tileSize := 256
+  }
+  let set := vp.visibleTileSet 1
+  -- Should contain the center tile
+  let centerTile := latLonToTile { lat := 0.0, lon := 0.0 } 3
+  ensure (set.contains centerTile) "set should contain center tile"
+
+test "centerTilePos returns fractional position" := do
+  let vp : MapViewport := {
+    centerLat := 0.0
+    centerLon := 0.0
+    zoom := 2
+    screenWidth := 512
+    screenHeight := 512
+  }
+  let (x, y) := vp.centerTilePos
+  -- At lat=0, lon=0, zoom=2: should be center of 4x4 grid
+  ensure (x > 1.9 && x < 2.1) "x should be approximately 2.0"
+  ensure (y > 1.9 && y < 2.1) "y should be approximately 2.0"
+
+#generate_tests
+
+end TilesetTests.Viewport
+
+-- ============================================================================
+-- State Tests
+-- ============================================================================
+
+namespace TilesetTests.State
+
+open Crucible
+open Tileset
+
+testSuite "TileState"
+
+test "pending converts to loading" := do
+  let state := TileState.pending
+  state.toLoadState ≡ TileLoadState.loading
+
+test "loaded converts to ready" := do
+  let img : Raster.Image := { width := 512, height := 512, format := .rgba, data := .empty }
+  let state := TileState.loaded img .empty
+  match state.toLoadState with
+  | .ready _ => pure ()
+  | _ => throw <| IO.userError "Expected ready state"
+
+test "exhausted converts to error" := do
+  let rs := Retry.RetryState.initialFailure 0
+  let rs' := { rs with errorMessage := "test error" }
+  let state := TileState.exhausted rs'
+  match state.toLoadState with
+  | .error msg => msg ≡ "test error"
+  | _ => throw <| IO.userError "Expected error state"
+
+test "getImage? returns image when loaded" := do
+  let img : Raster.Image := { width := 256, height := 256, format := .rgb, data := .empty }
+  let state := TileState.loaded img .empty
+  match state.getImage? with
+  | some i => i.width ≡ 256
+  | none => throw <| IO.userError "Expected some image"
+
+test "getImage? returns none for pending" := do
+  let state := TileState.pending
+  match state.getImage? with
+  | none => pure ()
+  | some _ => throw <| IO.userError "Expected none"
+
+#generate_tests
+
+end TilesetTests.State
+
+-- ============================================================================
+-- Cache Tests
+-- ============================================================================
+
+namespace TilesetTests.Cache
+
+open Crucible
+open Tileset
+
+testSuite "MemoryCache"
+
+test "empty cache has size 0" := do
+  let cache := MemoryCache.empty
+  cache.size ≡ 0
+
+test "insert and get" := do
+  let coord : TileCoord := { x := 1, y := 2, z := 3 }
+  let state := TileState.pending
+  let cache := MemoryCache.empty.insert coord state
+  match cache.get coord with
+  | some s => ensure s.isLoading "state should be loading"
+  | none => throw <| IO.userError "Expected some state"
+
+test "contains returns true after insert" := do
+  let coord : TileCoord := { x := 5, y := 5, z := 5 }
+  let cache := MemoryCache.empty.insert coord TileState.pending
+  ensure (cache.contains coord) "cache should contain inserted coord"
+  ensure (not (cache.contains { x := 0, y := 0, z := 0 })) "cache should not contain other coord"
+
+test "stateCounts tracks categories" := do
+  let img : Raster.Image := { width := 1, height := 1, format := .rgba, data := .empty }
+  let cache := MemoryCache.empty
+    |>.insert { x := 1, y := 1, z := 1 } (TileState.loaded img .empty)
+    |>.insert { x := 2, y := 2, z := 2 } (TileState.cached .empty 0)
+    |>.insert { x := 3, y := 3, z := 3 } TileState.pending
+  let (loaded, cached, other) := cache.stateCounts
+  loaded ≡ 1
+  cached ≡ 1
+  other ≡ 1
+
+test "removeCoords removes tiles" := do
+  let cache := MemoryCache.empty
+    |>.insert { x := 1, y := 1, z := 1 } TileState.pending
+    |>.insert { x := 2, y := 2, z := 2 } TileState.pending
+    |>.insert { x := 3, y := 3, z := 3 } TileState.pending
+  let cache' := cache.removeCoords [{ x := 1, y := 1, z := 1 }, { x := 3, y := 3, z := 3 }]
+  cache'.size ≡ 1
+  ensure (cache'.contains { x := 2, y := 2, z := 2 }) "cache should contain remaining coord"
+
+#generate_tests
+
+end TilesetTests.Cache
+
+-- ============================================================================
+-- MapBounds Tests
+-- ============================================================================
+
+namespace TilesetTests.Bounds
+
+open Crucible
+open Tileset
+
+testSuite "MapBounds"
+
+test "world bounds contain equator" := do
+  ensure (MapBounds.world.contains 0.0 0.0) "world bounds should contain equator"
+
+test "usa bounds contain San Francisco" := do
+  ensure (MapBounds.usa.contains 37.7749 (-122.4194)) "USA bounds should contain San Francisco"
+
+test "usa bounds do not contain London" := do
+  ensure (not (MapBounds.usa.contains 51.5074 (-0.1278))) "USA bounds should not contain London"
+
+test "clampZoom respects bounds" := do
+  let bounds := MapBounds.usa
+  (bounds.clampZoom 1) ≡ 3  -- USA has minZoom 3
+  (bounds.clampZoom 25) ≡ 19  -- USA has maxZoom 19
+  (bounds.clampZoom 10) ≡ 10
+
+#generate_tests
+
+end TilesetTests.Bounds
+
+-- ============================================================================
+-- Main Test Runner
+-- ============================================================================
+
+open Crucible in
+def main (args : List String) : IO UInt32 := runAllSuitesFiltered args
