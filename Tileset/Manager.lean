@@ -63,8 +63,6 @@ structure TileManager where
   bindingsRef : IO.Ref (HashMap TileCoord TileBinding)
   /-- Current frame counter (for LRU tracking and retry timing) -/
   frameCounterRef : IO.Ref Nat
-  /-- Timeline context for creating dynamics -/
-  timelineCtx : Reactive.TimelineCtx Spider
 
 namespace TileManager
 
@@ -77,7 +75,6 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let diskCacheIndexRef ← SpiderM.liftIO <| IO.mkRef (DiskCache.emptyIndex diskConfig)
   let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
   let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
-  let timelineCtx ← SpiderM.getTimelineCtx
   return {
     config
     httpClient
@@ -85,25 +82,23 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     diskCacheIndexRef
     bindingsRef
     frameCounterRef
-    timelineCtx
   }
 
 /-- Internal: Create a TileBinding with a Dynamic -/
-private def createBinding (mgr : TileManager) (initial : TileLoadState)
-    : IO TileBinding := do
-  let nodeId ← mgr.timelineCtx.freshNodeId
-  let (dynamic, updateFn) ← Dynamic.newWithId (t := Spider) initial nodeId
-  return { dynamic, update := updateFn }
+private def createBinding (initial : TileLoadState) : SpiderM TileBinding := do
+  let (event, trigger) ← Reactive.newTriggerEvent (t := Spider) (a := TileLoadState)
+  let dynamic ← Reactive.holdDyn initial event
+  return { dynamic, update := trigger }
 
 /-- Internal: Get or create a binding for a tile -/
 private def getOrCreateBinding (mgr : TileManager) (coord : TileCoord)
-    (initialState : TileLoadState) : IO TileBinding := do
-  let bindings ← mgr.bindingsRef.get
+    (initialState : TileLoadState) : SpiderM TileBinding := do
+  let bindings ← SpiderM.liftIO mgr.bindingsRef.get
   match bindings[coord]? with
   | some binding => return binding
   | none =>
-    let binding ← mgr.createBinding initialState
-    mgr.bindingsRef.modify (·.insert coord binding)
+    let binding ← createBinding initialState
+    SpiderM.liftIO <| mgr.bindingsRef.modify (·.insert coord binding)
     return binding
 
 /-- Internal: Update a tile's state and notify subscribers -/
@@ -263,31 +258,33 @@ def requestTile (mgr : TileManager) (coord : TileCoord)
   match cache.get coord with
   | some state =>
     -- Already have state, just return/create binding
-    let binding ← SpiderM.liftIO <| mgr.getOrCreateBinding coord state.toLoadState
+    let binding ← mgr.getOrCreateBinding coord state.toLoadState
     return binding.dynamic
   | none =>
     -- New tile request
-    SpiderM.liftIO do
-      -- Try disk cache first
-      if let some bytes ← mgr.tryDiskCache coord then
-        -- Decode the image
+    -- Try disk cache first
+    if let some bytes ← SpiderM.liftIO (mgr.tryDiskCache coord) then
+      let decoded? ← SpiderM.liftIO do
         try
           let img ← Raster.Image.loadFromMemory bytes
-          let state := TileState.loaded img bytes
-          mgr.updateTileState coord state
-          let binding ← mgr.getOrCreateBinding coord state.toLoadState
-          return binding.dynamic
+          pure (some img)
         catch e =>
           -- Disk cache corrupted, fall through to network fetch
           IO.eprintln s!"[Tileset] Disk cache decode error for {coord}: {e}"
+          pure none
+      if let some img := decoded? then
+        let state := TileState.loaded img bytes
+        SpiderM.liftIO <| mgr.updateTileState coord state
+        let binding ← mgr.getOrCreateBinding coord state.toLoadState
+        return binding.dynamic
 
-      -- Create binding with loading state
-      let binding ← mgr.getOrCreateBinding coord .loading
+    -- Create binding with loading state
+    let binding ← mgr.getOrCreateBinding coord .loading
 
-      -- Start async fetch (non-blocking)
-      mgr.startFetchAsync coord false
+    -- Start async fetch (non-blocking)
+    SpiderM.liftIO <| mgr.startFetchAsync coord false
 
-      return binding.dynamic
+    return binding.dynamic
 
 /-- Increment the frame counter. Call this once per frame for retry timing.
     Note: This is optional if you don't need frame-accurate retry timing. -/
