@@ -35,6 +35,12 @@ test "childTiles and parentTile are inverse" := do
   for child in children do
     child.parentTile ≡ parent
 
+test "ancestorAt steps to target zoom" := do
+  let coord : TileCoord := { x := 5, y := 7, z := 3 }
+  TileCoord.ancestorAt coord 3 ≡ coord
+  TileCoord.ancestorAt coord 2 ≡ { x := 2, y := 3, z := 2 : TileCoord }
+  TileCoord.ancestorAt coord 1 ≡ { x := 1, y := 1, z := 1 : TileCoord }
+
 #generate_tests
 
 end TilesetTests.Coord
@@ -227,6 +233,22 @@ test "visibleTileSet creates HashSet" := do
   -- Should contain the center tile
   let centerTile := latLonToTile { lat := 0.0, lon := 0.0 } 3
   ensure (set.contains centerTile) "set should contain center tile"
+
+test "visibleTileSetWithFallbackDepths includes parent and child tiles" := do
+  let vp : MapViewport := {
+    centerLat := 0.0
+    centerLon := 0.0
+    zoom := 2
+    screenWidth := 256
+    screenHeight := 256
+    tileSize := 256
+  }
+  let centerTile := latLonToTile { lat := 0.0, lon := 0.0 } 2
+  let set := vp.visibleTileSetWithFallbackDepths 0 1 1
+  ensure (set.contains centerTile) "set should contain center tile"
+  ensure (set.contains centerTile.parentTile) "set should contain parent tile"
+  let child := centerTile.childTiles[0]!
+  ensure (set.contains child) "set should contain child tile"
 
 test "centerTilePos returns fractional position" := do
   let vp : MapViewport := {
