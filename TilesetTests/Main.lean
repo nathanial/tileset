@@ -356,7 +356,7 @@ open Tileset
 open Reactive.Host
 
 testSuite "TileManager"
-private def waitForReady (dyn : Dyn TileLoadState)
+def waitForReady (dyn : Dyn TileLoadState)
     (timeoutMs : Nat := 2000) (stepMs : Nat := 20) : IO Bool := do
   let stepMs := if stepMs == 0 then 1 else stepMs
   let steps := timeoutMs / stepMs
@@ -377,7 +377,7 @@ private def waitForReady (dyn : Dyn TileLoadState)
             loop n
   loop steps
 
-private def shutdownManager (mgr : TileManager) : IO Unit := do
+def shutdownManager (mgr : TileManager) : IO Unit := do
   let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
   for task in mgr.workerTasks do
     IO.cancel task
@@ -425,6 +425,97 @@ test "cached tile rehydrates after eviction" := do
 #generate_tests
 
 end TilesetTests.Manager
+
+-- ============================================================================
+-- TileManager Network Tests
+-- ============================================================================
+
+namespace TilesetTests.ManagerNetwork
+
+open Crucible
+open Tileset
+open Reactive.Host
+
+testSuite "TileManager Network"
+
+beforeAll := do
+  Wisp.FFI.globalInit
+
+afterAll := do
+  Wisp.FFI.globalCleanup
+  Wisp.HTTP.Client.shutdown
+
+private def freshCacheDir : IO String := do
+  let stamp ← IO.monoMsNow
+  pure s!"/tmp/tileset_test_cache_{stamp}"
+
+private def waitForDiskCache (config : DiskCacheConfig) (coord : TileCoord)
+    (timeoutMs : Nat := 2000) (stepMs : Nat := 50) : IO Bool := do
+  let stepMs := if stepMs == 0 then 1 else stepMs
+  let steps := timeoutMs / stepMs
+  let rec loop : Nat → IO Bool
+    | 0 => DiskCache.exists? config coord
+    | n + 1 => do
+        if (← DiskCache.exists? config coord) then
+          pure true
+        else
+          IO.sleep stepMs.toUInt32
+          loop n
+  loop steps
+
+test "network tile loads" (timeout := 20000) := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 0, y := 0, z := 0 }
+  let cacheDir ← freshCacheDir
+  let config : TileManagerConfig := {
+    provider := TileProvider.openStreetMap
+    diskCacheDir := cacheDir
+    httpTimeout := 10000
+    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    workerCount := 2
+  }
+  let mgr ← (TileManager.new config).run env
+  try
+    let dyn ← (TileManager.requestTile mgr coord).run env
+    let ready ← TilesetTests.Manager.waitForReady dyn (timeoutMs := 15000) (stepMs := 100)
+    ensure ready "network tile should load"
+    let finalState ← dyn.sample
+    match finalState with
+    | .ready img =>
+        let expected := config.provider.tileSize.toNat
+        img.width ≡ expected
+        img.height ≡ expected
+    | _ => throw <| IO.userError "Expected ready tile after network fetch"
+  finally
+    TilesetTests.Manager.shutdownManager mgr
+    env.currentScope.dispose
+
+test "network tile writes disk cache" (timeout := 20000) := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 0, y := 0, z := 0 }
+  let cacheDir ← freshCacheDir
+  let config : TileManagerConfig := {
+    provider := TileProvider.openStreetMap
+    diskCacheDir := cacheDir
+    httpTimeout := 10000
+    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    workerCount := 2
+  }
+  let diskConfig := DiskCacheConfig.fromProvider config.provider cacheDir config.diskCacheMaxSize
+  let mgr ← (TileManager.new config).run env
+  try
+    let dyn ← (TileManager.requestTile mgr coord).run env
+    let ready ← TilesetTests.Manager.waitForReady dyn (timeoutMs := 15000) (stepMs := 100)
+    ensure ready "network tile should load"
+    let cached ← waitForDiskCache diskConfig coord (timeoutMs := 5000) (stepMs := 100)
+    ensure cached "disk cache entry should exist after download"
+  finally
+    TilesetTests.Manager.shutdownManager mgr
+    env.currentScope.dispose
+
+#generate_tests
+
+end TilesetTests.ManagerNetwork
 
 -- ============================================================================
 -- MapBounds Tests
