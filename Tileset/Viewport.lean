@@ -90,6 +90,31 @@ def visibleTileSetWithFallbacks (vp : MapViewport) (buffer : Int) : HashSet Tile
     s.insert children[0]! |>.insert children[1]! |>.insert children[2]! |>.insert children[3]!
   ) withGrandparents
 
+/-- Create a HashSet including tiles at configurable adjacent zoom levels for fallback rendering.
+    `parentDepth` adds ancestors up to N levels; `childDepth` adds descendants up to N levels. -/
+def visibleTileSetWithFallbackDepths (vp : MapViewport) (buffer : Int)
+    (parentDepth childDepth : Nat) : HashSet TileCoord :=
+  let baseTiles := vp.visibleTilesWithBuffer buffer
+  Id.run do
+    let mut set : HashSet TileCoord := baseTiles.foldl (fun s t => s.insert t) {}
+    -- Add parent tiles (for zoom-in fallback)
+    let mut parentLevel := baseTiles
+    for _ in [:parentDepth] do
+      let filtered := parentLevel.filter (fun t => t.z > 0)
+      let next := filtered.map (fun t => t.parentTile)
+      for t in next do
+        set := set.insert t
+      parentLevel := next
+    -- Add child tiles (for zoom-out fallback)
+    let mut childLevel := baseTiles
+    for _ in [:childDepth] do
+      let filtered := childLevel.filter (fun t => t.z < maxZoomLevel)
+      let next := filtered.foldl (fun acc t => acc ++ t.childTiles.toList) []
+      for t in next do
+        set := set.insert t
+      childLevel := next
+    return set
+
 /-- Calculate fractional tile position for the center -/
 def centerTilePos (vp : MapViewport) : (Float × Float) :=
   let n := Float.pow 2.0 (intToFloat vp.zoom)

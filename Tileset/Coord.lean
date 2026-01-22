@@ -113,6 +113,15 @@ def childTiles (coord : TileCoord) : Array TileCoord :=
    , { x := x2,     y := y2 + 1, z := coord.z + 1 }
    , { x := x2 + 1, y := y2 + 1, z := coord.z + 1 } ]
 
+/-- Get the ancestor tile at a specific zoom level (clamps to self if target is deeper). -/
+def ancestorAt (coord : TileCoord) (targetZoom : Int) : TileCoord :=
+  if coord.z <= targetZoom then
+    coord
+  else
+    let dz : Nat := (coord.z - targetZoom).toNat
+    let divisor : Int := natToInt (Nat.pow 2 dz)
+    { x := coord.x / divisor, y := coord.y / divisor, z := targetZoom }
+
 /-- Convert to string for debugging -/
 def toString (coord : TileCoord) : String :=
   s!"({coord.z}/{coord.x}/{coord.y})"
