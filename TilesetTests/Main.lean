@@ -354,6 +354,33 @@ test "stateCounts tracks categories" := do
   cached ≡ 1
   other ≡ 1
 
+test "cachedTilesToLoad filters by visible set" := do
+  let c1 : TileCoord := { x := 1, y := 1, z := 2 }
+  let c2 : TileCoord := { x := 2, y := 2, z := 2 }
+  let cache := MemoryCache.empty
+    |>.insert c1 (TileState.cached .empty 0)
+    |>.insert c2 (TileState.cached .empty 0)
+  let visible : Std.HashSet TileCoord := ({ } : Std.HashSet TileCoord).insert c1
+  let results := cache.cachedTilesToLoad visible
+  ensure (results.any (fun (coord, _) => coord == c1)) "visible cached tile should be returned"
+  ensure (results.all (fun (coord, _) => coord != c2)) "non-visible cached tile should be filtered"
+
+test "tilesToUnload and staleTiles respect keep set" := do
+  let loadedCoord : TileCoord := { x := 0, y := 0, z := 1 }
+  let cachedCoord : TileCoord := { x := 1, y := 0, z := 1 }
+  let pendingCoord : TileCoord := { x := 2, y := 0, z := 1 }
+  let img := Raster.Image.create 1 1 .rgba [0, 0, 0, 255]
+  let cache := MemoryCache.empty
+    |>.insert loadedCoord (TileState.loaded img .empty)
+    |>.insert cachedCoord (TileState.cached .empty 0)
+    |>.insert pendingCoord TileState.pending
+  let keepSet : Std.HashSet TileCoord := ({ } : Std.HashSet TileCoord).insert cachedCoord
+  let toUnload := cache.tilesToUnload keepSet
+  ensure (toUnload.any (fun (coord, _, _) => coord == loadedCoord)) "loaded tile outside keep set should unload"
+  let stale := cache.staleTiles keepSet
+  ensure (stale.contains pendingCoord) "pending tile outside keep set should be stale"
+  ensure (!stale.contains cachedCoord) "cached tile should not be stale"
+
 test "removeCoords removes tiles" := do
   let cache := MemoryCache.empty
     |>.insert { x := 1, y := 1, z := 1 } TileState.pending
@@ -438,6 +465,34 @@ test "cached tile rehydrates after eviction" := do
     match finalState with
     | .ready readyImg => readyImg.width ≡ 2
     | _ => throw <| IO.userError "Expected ready tile after decode"
+  finally
+    shutdownManager mgr
+    env.currentScope.dispose
+
+test "disk cache hit avoids network fetch" := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 1, y := 1, z := 1 }
+  let cacheDir ← do
+    let stamp ← IO.monoMsNow
+    pure s!"/tmp/tileset_test_cache_{stamp}"
+  let config : TileManagerConfig := {
+    provider := TileProvider.openStreetMap
+    diskCacheDir := cacheDir
+    httpTimeout := 1000
+    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    workerCount := 1
+  }
+  let diskConfig := DiskCacheConfig.fromProvider config.provider cacheDir config.diskCacheMaxSize
+  let img := Raster.Image.create 2 2 .rgba [0, 0, 255, 255]
+  let bytes ← Raster.Image.encode img .png
+  DiskCache.write diskConfig coord bytes
+  let mgr ← (TileManager.new config).run env
+  try
+    let dyn ← (TileManager.requestTile mgr coord).run env
+    let ready ← waitForReady dyn (timeoutMs := 2000) (stepMs := 20)
+    ensure ready "cached tile should load from disk without network"
+    let inflight ← TileManager.inFlightCount mgr
+    inflight ≡ 0
   finally
     shutdownManager mgr
     env.currentScope.dispose

@@ -426,6 +426,9 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     Updates happen asynchronously - no polling required. -/
 def requestTile (mgr : TileManager) (coord : TileCoord)
     : SpiderM (Dyn TileLoadState) := do
+  let wasCanceled ← SpiderM.liftIO do
+    let canceled ← mgr.canceledRef.get
+    pure (canceled.contains coord)
   SpiderM.liftIO <| mgr.canceledRef.modify (·.erase coord)
   -- Check if we already have this tile
   let cache ← SpiderM.liftIO mgr.memoryCacheRef.get
@@ -437,7 +440,10 @@ def requestTile (mgr : TileManager) (coord : TileCoord)
     | .cached bytes _ =>
         SpiderM.liftIO <| mgr.updateTileState coord .pending
         SpiderM.liftIO <| enqueueJob mgr (TileJob.decode coord bytes)
-    | _ => pure ()
+    | _ =>
+        if wasCanceled then
+          SpiderM.liftIO <| mgr.updateTileState coord .pending
+          SpiderM.liftIO <| enqueueJob mgr (TileJob.load coord)
     return binding.dynamic
   | none =>
     -- New tile request (enqueue background load)
