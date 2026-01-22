@@ -51,6 +51,10 @@ private structure TileBinding where
   /-- Function to update the dynamic's value -/
   update : TileLoadState → IO Unit
 
+private structure InFlight where
+  cancel : Wisp.HTTP.CancelHandle
+  cancelPromise : IO.Promise Unit
+
 private inductive TileJob where
   | load (coord : TileCoord)
   | fetch (coord : TileCoord)
@@ -69,6 +73,10 @@ structure TileManager where
   diskCacheIndexRef : IO.Ref DiskCacheIndex
   /-- Per-tile reactive bindings -/
   bindingsRef : IO.Ref (HashMap TileCoord TileBinding)
+  /-- In-flight network requests (for cancellation) -/
+  inFlightRef : IO.Ref (HashMap TileCoord InFlight)
+  /-- Canceled tiles (skip queued work until re-requested) -/
+  canceledRef : IO.Ref (HashSet TileCoord)
   /-- Current frame counter (for LRU tracking and retry timing) -/
   frameCounterRef : IO.Ref Nat
   /-- Background job queue for tile IO/decoding -/
@@ -115,6 +123,25 @@ private def enqueueJob (mgr : TileManager) (job : TileJob) : IO Unit := do
   else
     let _ ← Std.CloseableChannel.Sync.send mgr.workerQueue job
     pure ()
+
+private def isCanceled (mgr : TileManager) (coord : TileCoord) : IO Bool := do
+  let canceled ← mgr.canceledRef.get
+  pure (canceled.contains coord)
+
+private def cancelCoord (mgr : TileManager) (coord : TileCoord) : IO Unit := do
+  mgr.canceledRef.modify (·.insert coord)
+  let inflight ← mgr.inFlightRef.get
+  if let some info := inflight[coord]? then
+    try
+      info.cancelPromise.resolve ()
+    catch _ =>
+      pure ()
+    info.cancel.cancel
+    mgr.inFlightRef.modify (·.erase coord)
+
+private def cancelCoords (mgr : TileManager) (coords : List TileCoord) : IO Unit := do
+  for coord in coords do
+    cancelCoord mgr coord
 
 private def decodeImage (coord : TileCoord) (bytes : ByteArray) : IO (Option Raster.Image) := do
   try
@@ -179,6 +206,9 @@ partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : Ret
   if (← mgr.isShutdownRef.get) then
     pure ()
   else
+  if (← mgr.isCanceled coord) then
+    pure ()
+  else
   if rs.isExhausted mgr.config.retryConfig then
     -- No more retries - mark as exhausted
     let state := TileState.exhausted rs
@@ -205,6 +235,9 @@ partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : Ret
 partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
     (result : Wisp.WispResult Wisp.Response) (wasRetry : Bool) : IO Unit := do
   if (← mgr.isShutdownRef.get) then
+    pure ()
+  else
+  if (← mgr.isCanceled coord) then
     pure ()
   else
   let frame ← mgr.frameCounterRef.get
@@ -256,6 +289,8 @@ end
 private def fetchFromNetwork (mgr : TileManager) (coord : TileCoord) (wasRetry : Bool) : IO Unit := do
   if (← mgr.isShutdownRef.get) then
     return ()
+  if (← mgr.isCanceled coord) then
+    return ()
   -- Mark as pending/retrying
   let cache ← mgr.memoryCacheRef.get
   let state := if wasRetry then
@@ -268,23 +303,31 @@ private def fetchFromNetwork (mgr : TileManager) (coord : TileCoord) (wasRetry :
 
   -- Start HTTP request and wait for completion on this worker thread
   let url := mgr.config.provider.tileUrl coord
-  let httpTask ← mgr.httpClient.get url
+  let cancelPromise ← IO.Promise.new
+  let (httpTask, cancelHandle) ← mgr.httpClient.getCancelable url
+  mgr.inFlightRef.modify (·.insert coord { cancel := cancelHandle, cancelPromise := cancelPromise })
   let httpWaitTask ← IO.asTask (pure httpTask.get)
   let shutdownWaitTask ← IO.asTask (do
     let _ := (mgr.shutdownPromise.result!).get
     return (Except.error (.ioError "shutdown") : Wisp.WispResult Wisp.Response)
   )
-  let result ← IO.waitAny [httpWaitTask, shutdownWaitTask]
+  let cancelWaitTask ← IO.asTask (do
+    let _ := (cancelPromise.result!).get
+    return (Except.error (.ioError "canceled") : Wisp.WispResult Wisp.Response)
+  )
+  let result ← IO.waitAny [httpWaitTask, shutdownWaitTask, cancelWaitTask]
   IO.cancel httpWaitTask
   IO.cancel shutdownWaitTask
-  if (← mgr.isShutdownRef.get) then
+  IO.cancel cancelWaitTask
+  mgr.inFlightRef.modify (·.erase coord)
+  if (← mgr.isShutdownRef.get) || (← mgr.isCanceled coord) then
     pure ()
   else
     match result with
     | .ok res =>
         match res with
         | .error (.ioError msg) =>
-            if msg == "shutdown" then
+            if msg == "shutdown" || msg == "canceled" then
               pure ()
             else
               handleFetchComplete mgr coord res wasRetry
@@ -314,15 +357,20 @@ private partial def workerLoop (mgr : TileManager) : IO Unit := do
     | some job =>
       try
         match job with
-        | .load coord => processLoad mgr coord
-        | .fetch coord => fetchFromNetwork mgr coord true
+        | .load coord =>
+          if !(← isCanceled mgr coord) then
+            processLoad mgr coord
+        | .fetch coord =>
+          if !(← isCanceled mgr coord) then
+            fetchFromNetwork mgr coord true
         | .decode coord bytes =>
-          match ← decodeImage coord bytes with
-          | some img =>
-              let state := TileState.loaded img bytes
-              mgr.updateTileState coord state
-          | none =>
-              fetchFromNetwork mgr coord false
+          if !(← isCanceled mgr coord) then
+            match ← decodeImage coord bytes with
+            | some img =>
+                let state := TileState.loaded img bytes
+                mgr.updateTileState coord state
+            | none =>
+                fetchFromNetwork mgr coord false
       catch e =>
         IO.eprintln s!"[Tileset] Worker error: {e}"
       loop
@@ -344,6 +392,8 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let diskConfig := DiskCacheConfig.fromProvider config.provider config.diskCacheDir config.diskCacheMaxSize
   let diskCacheIndexRef ← SpiderM.liftIO <| IO.mkRef (DiskCache.emptyIndex diskConfig)
   let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
+  let inFlightRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord InFlight)
+  let canceledRef ← SpiderM.liftIO <| IO.mkRef ({} : HashSet TileCoord)
   let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
   let workerQueue ← SpiderM.liftIO Std.CloseableChannel.Sync.new
   let isShutdownRef ← SpiderM.liftIO <| IO.mkRef false
@@ -354,6 +404,8 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     memoryCacheRef
     diskCacheIndexRef
     bindingsRef
+    inFlightRef
+    canceledRef
     frameCounterRef
     workerQueue
     workerTasks := #[]
@@ -374,6 +426,7 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     Updates happen asynchronously - no polling required. -/
 def requestTile (mgr : TileManager) (coord : TileCoord)
     : SpiderM (Dyn TileLoadState) := do
+  SpiderM.liftIO <| mgr.canceledRef.modify (·.erase coord)
   -- Check if we already have this tile
   let cache ← SpiderM.liftIO mgr.memoryCacheRef.get
   match cache.get coord with
@@ -413,6 +466,7 @@ def evictDistant (mgr : TileManager) (keepSet : HashSet TileCoord) : IO Unit := 
   -- Find stale tiles to remove completely
   let cacheAfterUnload ← mgr.memoryCacheRef.get
   let stale := cacheAfterUnload.staleTiles keepSet
+  cancelCoords mgr stale
   mgr.memoryCacheRef.modify (·.removeCoords stale)
 
   -- Remove bindings for stale tiles
@@ -434,6 +488,9 @@ def shutdown (mgr : TileManager) : IO Unit := do
     mgr.shutdownPromise.resolve ()
   catch _ =>
     pure ()
+  let inflight ← mgr.inFlightRef.get
+  for (coord, _) in inflight.toList do
+    cancelCoord mgr coord
   try
     let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
     pure ()
@@ -446,6 +503,16 @@ def shutdown (mgr : TileManager) : IO Unit := do
 def stats (mgr : TileManager) : IO (Nat × Nat × Nat) := do
   let cache ← mgr.memoryCacheRef.get
   return cache.stateCounts
+
+/-- Number of in-flight network requests. -/
+def inFlightCount (mgr : TileManager) : IO Nat := do
+  let inflight ← mgr.inFlightRef.get
+  pure inflight.size
+
+/-- Number of tiles currently marked canceled (until re-requested). -/
+def canceledCount (mgr : TileManager) : IO Nat := do
+  let canceled ← mgr.canceledRef.get
+  pure canceled.size
 
 /-- Check if a specific tile is loaded and ready -/
 def isReady (mgr : TileManager) (coord : TileCoord) : IO Bool := do

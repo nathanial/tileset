@@ -511,6 +511,44 @@ test "network tile writes disk cache" (timeout := 20000) := do
     TilesetTests.Manager.shutdownManager mgr
     env.currentScope.dispose
 
+test "evict cancels pending tile" (timeout := 10000) := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 0, y := 0, z := 0 }
+  let slowProvider : TileProvider := {
+    name := "blackhole"
+    urlTemplate := "http://10.255.255.1/{z}/{x}/{y}.png"
+    subdomains := #["a"]
+    tileSize := 256
+    maxZoom := 19
+    minZoom := 0
+    attribution := ""
+  }
+  let config : TileManagerConfig := {
+    provider := slowProvider
+    httpTimeout := 60000
+    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    workerCount := 1
+  }
+  let mgr ← (TileManager.new config).run env
+  try
+    let _dyn ← (TileManager.requestTile mgr coord).run env
+    -- Evict immediately to cancel any in-flight request.
+    let keepSet : Std.HashSet TileCoord := {}
+    TileManager.evictDistant mgr keepSet
+    for _ in [:60] do
+      let inflight ← TileManager.inFlightCount mgr
+      let canceled ← TileManager.canceledCount mgr
+      if inflight == 0 && canceled > 0 then
+        break
+      IO.sleep 50
+    let inflight ← TileManager.inFlightCount mgr
+    let canceled ← TileManager.canceledCount mgr
+    inflight ≡ 0
+    ensure (canceled > 0) "expected canceled tile request"
+  finally
+    TilesetTests.Manager.shutdownManager mgr
+    env.currentScope.dispose
+
 #generate_tests
 
 end TilesetTests.ManagerNetwork
