@@ -549,6 +549,44 @@ test "evict cancels pending tile" (timeout := 10000) := do
     TilesetTests.Manager.shutdownManager mgr
     env.currentScope.dispose
 
+test "re-request clears canceled flag" (timeout := 10000) := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 1, y := 1, z := 1 }
+  let slowProvider : TileProvider := {
+    name := "blackhole"
+    urlTemplate := "http://10.255.255.1/{z}/{x}/{y}.png"
+    subdomains := #["a"]
+    tileSize := 256
+    maxZoom := 19
+    minZoom := 0
+    attribution := ""
+  }
+  let config : TileManagerConfig := {
+    provider := slowProvider
+    httpTimeout := 60000
+    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    workerCount := 1
+  }
+  let mgr ← (TileManager.new config).run env
+  try
+    let _ ← (TileManager.requestTile mgr coord).run env
+    let keepSet : Std.HashSet TileCoord := {}
+    TileManager.evictDistant mgr keepSet
+    for _ in [:60] do
+      let inflight ← TileManager.inFlightCount mgr
+      let canceled ← TileManager.canceledCount mgr
+      if inflight == 0 && canceled > 0 then
+        break
+      IO.sleep 50
+    let canceledBefore ← TileManager.canceledCount mgr
+    ensure (canceledBefore > 0) "expected canceled flag before re-request"
+    let _ ← (TileManager.requestTile mgr coord).run env
+    let canceledAfter ← TileManager.canceledCount mgr
+    ensure (canceledAfter < canceledBefore) "expected canceled flag cleared on re-request"
+  finally
+    TilesetTests.Manager.shutdownManager mgr
+    env.currentScope.dispose
+
 #generate_tests
 
 end TilesetTests.ManagerNetwork
