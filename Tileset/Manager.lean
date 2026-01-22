@@ -75,6 +75,10 @@ structure TileManager where
   workerQueue : Std.CloseableChannel.Sync TileJob
   /-- Background worker tasks -/
   workerTasks : Array (Task (Except IO.Error Unit))
+  /-- Shutdown flag (prevents new work from starting) -/
+  isShutdownRef : IO.Ref Bool
+  /-- Shutdown signal (used to abort in-flight fetch waits) -/
+  shutdownPromise : IO.Promise Unit
 
 namespace TileManager
 
@@ -106,8 +110,11 @@ private def updateTileState (mgr : TileManager) (coord : TileCoord) (state : Til
     binding.update state.toLoadState
 
 private def enqueueJob (mgr : TileManager) (job : TileJob) : IO Unit := do
-  let _ ← Std.CloseableChannel.Sync.send mgr.workerQueue job
-  pure ()
+  if (← mgr.isShutdownRef.get) then
+    pure ()
+  else
+    let _ ← Std.CloseableChannel.Sync.send mgr.workerQueue job
+    pure ()
 
 private def decodeImage (coord : TileCoord) (bytes : ByteArray) : IO (Option Raster.Image) := do
   try
@@ -152,10 +159,26 @@ private def saveToDiskCache (mgr : TileManager) (coord : TileCoord) (data : Byte
     mgr.diskCacheIndexRef.set index''
   catch _ => pure ()  -- Ignore write errors
 
+-- Sleep in small increments, aborting early if the manager is shutting down.
+private def sleepWithShutdown (mgr : TileManager) (delayMs : Nat) (stepMs : Nat := 100) : IO Bool := do
+  let stepMs := if stepMs == 0 then 1 else stepMs
+  let steps := (delayMs + stepMs - 1) / stepMs
+  let mut remaining := delayMs
+  for _ in [:steps] do
+    if (← mgr.isShutdownRef.get) then
+      return false
+    let step := Nat.min stepMs remaining
+    IO.sleep step.toUInt32
+    remaining := remaining - step
+  pure true
+
 mutual
 /-- Internal: Schedule a retry check after the backoff delay -/
 partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : RetryState)
     : IO Unit := do
+  if (← mgr.isShutdownRef.get) then
+    pure ()
+  else
   if rs.isExhausted mgr.config.retryConfig then
     -- No more retries - mark as exhausted
     let state := TileState.exhausted rs
@@ -164,22 +187,26 @@ partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : Ret
     -- Schedule retry after backoff delay
     let delayMs := rs.backoffDelay mgr.config.retryConfig * 16  -- ~16ms per frame at 60fps
     let retryAction : IO Unit := do
-      IO.sleep delayMs.toUInt32
-      -- Check if tile is still in failed state (not evicted or replaced)
-      let cache ← mgr.memoryCacheRef.get
-      match cache.get coord with
-      | some (.failed currentRs) =>
-        if currentRs == rs then  -- Still the same failure
-          enqueueJob mgr (TileJob.fetch coord)
-        else
-          pure ()
-      | _ => pure ()  -- Tile state changed, skip retry
+      let shouldContinue ← sleepWithShutdown mgr delayMs
+      if shouldContinue then
+        -- Check if tile is still in failed state (not evicted or replaced)
+        let cache ← mgr.memoryCacheRef.get
+        match cache.get coord with
+        | some (.failed currentRs) =>
+          if currentRs == rs then  -- Still the same failure
+            enqueueJob mgr (TileJob.fetch coord)
+          else
+            pure ()
+        | _ => pure ()  -- Tile state changed, skip retry
     let _ ← retryAction.asTask
     pure ()
 
 /-- Internal: Handle fetch completion (called from background task) -/
 partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
     (result : Wisp.WispResult Wisp.Response) (wasRetry : Bool) : IO Unit := do
+  if (← mgr.isShutdownRef.get) then
+    pure ()
+  else
   let frame ← mgr.frameCounterRef.get
   match result with
   | .ok response =>
@@ -189,8 +216,8 @@ partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
         let img ← Raster.Image.loadFromMemoryAs response.body .rgba
         let state := TileState.loaded img response.body
         mgr.updateTileState coord state
-        -- Save to disk cache in background (fire and forget)
-        let _ ← (mgr.saveToDiskCache coord response.body).asTask
+        -- Save to disk cache on worker thread
+        mgr.saveToDiskCache coord response.body
       catch e =>
         -- Decode error - treat as failure
         let msg := s!"Decode error: {e}"
@@ -227,6 +254,8 @@ partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
 end
 
 private def fetchFromNetwork (mgr : TileManager) (coord : TileCoord) (wasRetry : Bool) : IO Unit := do
+  if (← mgr.isShutdownRef.get) then
+    return ()
   -- Mark as pending/retrying
   let cache ← mgr.memoryCacheRef.get
   let state := if wasRetry then
@@ -240,8 +269,30 @@ private def fetchFromNetwork (mgr : TileManager) (coord : TileCoord) (wasRetry :
   -- Start HTTP request and wait for completion on this worker thread
   let url := mgr.config.provider.tileUrl coord
   let httpTask ← mgr.httpClient.get url
-  let result := httpTask.get
-  handleFetchComplete mgr coord result wasRetry
+  let httpWaitTask ← IO.asTask (pure httpTask.get)
+  let shutdownWaitTask ← IO.asTask (do
+    let _ := (mgr.shutdownPromise.result!).get
+    return (Except.error (.ioError "shutdown") : Wisp.WispResult Wisp.Response)
+  )
+  let result ← IO.waitAny [httpWaitTask, shutdownWaitTask]
+  IO.cancel httpWaitTask
+  IO.cancel shutdownWaitTask
+  if (← mgr.isShutdownRef.get) then
+    pure ()
+  else
+    match result with
+    | .ok res =>
+        match res with
+        | .error (.ioError msg) =>
+            if msg == "shutdown" then
+              pure ()
+            else
+              handleFetchComplete mgr coord res wasRetry
+        | _ =>
+            handleFetchComplete mgr coord res wasRetry
+    | .error err =>
+        let res : Wisp.WispResult Wisp.Response := .error (.ioError s!"{err}")
+        handleFetchComplete mgr coord res wasRetry
 
 private def processLoad (mgr : TileManager) (coord : TileCoord) : IO Unit := do
   -- Try disk cache first (off main thread)
@@ -295,6 +346,8 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
   let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
   let workerQueue ← SpiderM.liftIO Std.CloseableChannel.Sync.new
+  let isShutdownRef ← SpiderM.liftIO <| IO.mkRef false
+  let shutdownPromise ← SpiderM.liftIO <| IO.Promise.new
   let mgr := {
     config
     httpClient
@@ -304,6 +357,8 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     frameCounterRef
     workerQueue
     workerTasks := #[]
+    isShutdownRef
+    shutdownPromise
   }
   let workerTasks ← SpiderM.liftIO <| startWorkers mgr
   return { mgr with workerTasks := workerTasks }
@@ -371,6 +426,21 @@ def evictDistant (mgr : TileManager) (keepSet : HashSet TileCoord) : IO Unit := 
 
   for coord in toEvict do
     mgr.bindingsRef.modify (·.erase coord)
+
+/-- Shut down background workers and prevent new work. -/
+def shutdown (mgr : TileManager) : IO Unit := do
+  mgr.isShutdownRef.set true
+  try
+    mgr.shutdownPromise.resolve ()
+  catch _ =>
+    pure ()
+  try
+    let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
+    pure ()
+  catch _ =>
+    pure ()
+  for task in mgr.workerTasks do
+    let _ := task.get
 
 /-- Get current cache statistics: (loaded, cached, other) -/
 def stats (mgr : TileManager) : IO (Nat × Nat × Nat) := do

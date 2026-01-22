@@ -378,9 +378,7 @@ def waitForReady (dyn : Dyn TileLoadState)
   loop steps
 
 def shutdownManager (mgr : TileManager) : IO Unit := do
-  let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
-  for task in mgr.workerTasks do
-    IO.cancel task
+  TileManager.shutdown mgr
   pure ()
 
 test "evictDistant preserves bytes in cached state" := do
