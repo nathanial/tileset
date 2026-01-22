@@ -10,6 +10,7 @@
 import Std.Data.HashMap
 import Std.Data.HashSet
 import Std.Sync.Channel
+import Std.Sync.Mutex
 import Tileset.Coord
 import Tileset.Provider
 import Tileset.State
@@ -55,10 +56,33 @@ private structure InFlight where
   cancel : Wisp.HTTP.CancelHandle
   cancelPromise : IO.Promise Unit
 
-private inductive TileJob where
-  | load (coord : TileCoord)
-  | fetch (coord : TileCoord)
-  | decode (coord : TileCoord) (bytes : ByteArray)
+private inductive TileJobKind where
+  | load
+  | fetch
+  | decode (bytes : ByteArray)
+  deriving Inhabited
+
+private structure TileJob where
+  coord : TileCoord
+  kind : TileJobKind
+  priority : Int
+  seq : Nat
+  generation : Nat
+  deriving Inhabited
+
+private structure RequestInfo where
+  priority : Int
+  generation : Nat
+  lastScheduled : Option Nat := none
+  deriving Inhabited
+
+private structure JobQueueState where
+  heap : Array TileJob := #[]
+  closed : Bool := false
+
+private structure JobQueue where
+  state : Std.Mutex JobQueueState
+  signal : Std.CloseableChannel.Sync Unit
 
 /-- The TileManager manages tile loading with reactive state -/
 structure TileManager where
@@ -77,10 +101,14 @@ structure TileManager where
   inFlightRef : IO.Ref (HashMap TileCoord InFlight)
   /-- Canceled tiles (skip queued work until re-requested) -/
   canceledRef : IO.Ref (HashSet TileCoord)
+  /-- Latest request info per tile (priority + generation). -/
+  priorityRef : IO.Ref (HashMap TileCoord RequestInfo)
   /-- Current frame counter (for LRU tracking and retry timing) -/
   frameCounterRef : IO.Ref Nat
   /-- Background job queue for tile IO/decoding -/
-  workerQueue : Std.CloseableChannel.Sync TileJob
+  jobQueue : JobQueue
+  /-- Monotonic sequence for stable FIFO ordering within priority -/
+  jobSeqRef : IO.Ref Nat
   /-- Background worker tasks -/
   workerTasks : Array (Task (Except IO.Error Unit))
   /-- Shutdown flag (prevents new work from starting) -/
@@ -117,12 +145,155 @@ private def updateTileState (mgr : TileManager) (coord : TileCoord) (state : Til
   if let some binding := bindings[coord]? then
     binding.update state.toLoadState
 
-private def enqueueJob (mgr : TileManager) (job : TileJob) : IO Unit := do
+@[inline] private def jobHigher (a b : TileJob) : Bool :=
+  if a.priority == b.priority then
+    a.seq < b.seq
+  else
+    a.priority > b.priority
+
+@[inline] private def parentIdx (i : Nat) : Nat := (i - 1) / 2
+@[inline] private def leftChildIdx (i : Nat) : Nat := 2 * i + 1
+@[inline] private def rightChildIdx (i : Nat) : Nat := 2 * i + 2
+
+@[inline] private def swapJob (arr : Array TileJob) (i j : Nat) : Array TileJob :=
+  let vi := arr[i]!
+  let vj := arr[j]!
+  (arr.set! i vj).set! j vi
+
+partial def siftUpJob (arr : Array TileJob) (i : Nat) : Array TileJob :=
+  if i == 0 then arr
+  else
+    let pi := parentIdx i
+    if pi < arr.size && i < arr.size then
+      if jobHigher arr[i]! arr[pi]! then
+        siftUpJob (swapJob arr i pi) pi
+      else
+        arr
+    else
+      arr
+
+partial def siftDownJob (arr : Array TileJob) (i : Nat) : Array TileJob :=
+  let left := leftChildIdx i
+  let right := rightChildIdx i
+  let size := arr.size
+  let best :=
+    let b1 := if left < size && jobHigher arr[left]! arr[i]! then left else i
+    if right < size && jobHigher arr[right]! arr[b1]! then right else b1
+  if best != i then
+    siftDownJob (swapJob arr i best) best
+  else
+    arr
+
+private def heapInsert (arr : Array TileJob) (job : TileJob) : Array TileJob :=
+  siftUpJob (arr.push job) arr.size
+
+private def heapPop? (arr : Array TileJob) : (Option TileJob × Array TileJob) :=
+  if arr.isEmpty then
+    (none, arr)
+  else if arr.size == 1 then
+    (some arr[0]!, #[])
+  else
+    let root := arr[0]!
+    let last := arr[arr.size - 1]!
+    let arr' := arr.pop
+    let arr'' := siftDownJob (arr'.set! 0 last) 0
+    (some root, arr'')
+
+private def jobQueueNew : IO JobQueue := do
+  let state ← Std.Mutex.new ({ heap := #[], closed := false } : JobQueueState)
+  let signal ← Std.CloseableChannel.Sync.new
+  return { state, signal }
+
+private def jobQueueClose (queue : JobQueue) : IO Unit := do
+  let _ ← queue.state.atomically do
+    let st ← get
+    if st.closed then
+      return ()
+    else
+      set { st with closed := true }
+  try
+    let _ ← Std.CloseableChannel.Sync.close queue.signal
+    pure ()
+  catch _ =>
+    pure ()
+
+private def jobQueuePush (queue : JobQueue) (job : TileJob) : IO Unit := do
+  let shouldSignal ← queue.state.atomically do
+    let st ← get
+    if st.closed then
+      return false
+    else
+      set { st with heap := heapInsert st.heap job }
+      return true
+  if shouldSignal then
+    try
+      let _ ← Std.CloseableChannel.Sync.send queue.signal ()
+      pure ()
+    catch _ =>
+      pure ()
+
+partial def jobQueueRecv (queue : JobQueue) : IO (Option TileJob) := do
+  let signal? ← queue.signal.recv
+  match signal? with
+  | none => return none
+  | some _ =>
+      let job? ← queue.state.atomically do
+        let st ← get
+        let (job?, heap') := heapPop? st.heap
+        set { st with heap := heap' }
+        return job?
+      match job? with
+      | some job => return some job
+      | none =>
+          let closed ← queue.state.atomically do
+            let st ← get
+            return st.closed
+          if closed then
+            return none
+          else
+            jobQueueRecv queue
+
+private def upsertRequestInfo (mgr : TileManager) (coord : TileCoord) (priority : Int)
+    (generation : Nat) : IO RequestInfo := do
+  mgr.priorityRef.modifyGet fun m =>
+    let info := match m[coord]? with
+      | some prev => { prev with priority := priority, generation := generation }
+      | none => { priority, generation }
+    (info, m.insert coord info)
+
+private def getRequestInfo? (mgr : TileManager) (coord : TileCoord) : IO (Option RequestInfo) := do
+  let priorities ← mgr.priorityRef.get
+  pure priorities[coord]?
+
+private def isPriorityStale (mgr : TileManager) (coord : TileCoord) (jobGeneration : Nat) : IO Bool := do
+  let priorities ← mgr.priorityRef.get
+  match priorities[coord]? with
+  | none => pure true
+  | some info => pure (info.generation != jobGeneration)
+
+private def markScheduled (mgr : TileManager) (coord : TileCoord) (generation : Nat) : IO Unit := do
+  mgr.priorityRef.modify fun m =>
+    match m[coord]? with
+    | none => m
+    | some info => m.insert coord { info with lastScheduled := some generation }
+
+private def enqueueJob (mgr : TileManager) (coord : TileCoord) (kind : TileJobKind)
+    (priority : Int) (generation : Nat) : IO Unit := do
   if (← mgr.isShutdownRef.get) then
     pure ()
   else
-    let _ ← Std.CloseableChannel.Sync.send mgr.workerQueue job
-    pure ()
+    let seq ← mgr.jobSeqRef.modifyGet fun n => (n, n + 1)
+    let job : TileJob := { coord, kind, priority, seq, generation }
+    jobQueuePush mgr.jobQueue job
+
+private def enqueueJobCurrent (mgr : TileManager) (coord : TileCoord) (kind : TileJobKind)
+    (fallback : Int := 0) : IO Unit := do
+  let info? ← getRequestInfo? mgr coord
+  match info? with
+  | none => pure ()
+  | some info =>
+      let priority := if info.priority == 0 then fallback else info.priority
+      enqueueJob mgr coord kind priority info.generation
 
 private def isCanceled (mgr : TileManager) (coord : TileCoord) : IO Bool := do
   let canceled ← mgr.canceledRef.get
@@ -130,6 +301,7 @@ private def isCanceled (mgr : TileManager) (coord : TileCoord) : IO Bool := do
 
 private def cancelCoord (mgr : TileManager) (coord : TileCoord) : IO Unit := do
   mgr.canceledRef.modify (·.insert coord)
+  mgr.priorityRef.modify (·.erase coord)
   let inflight ← mgr.inFlightRef.get
   if let some info := inflight[coord]? then
     try
@@ -224,7 +396,7 @@ partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : Ret
         match cache.get coord with
         | some (.failed currentRs) =>
           if currentRs == rs then  -- Still the same failure
-            enqueueJob mgr (TileJob.fetch coord)
+            enqueueJobCurrent mgr coord .fetch
           else
             pure ()
         | _ => pure ()  -- Tile state changed, skip retry
@@ -351,26 +523,30 @@ private def processLoad (mgr : TileManager) (coord : TileCoord) : IO Unit := do
 
 private partial def workerLoop (mgr : TileManager) : IO Unit := do
   let rec loop : IO Unit := do
-    let job? ← mgr.workerQueue.recv
+    let job? ← jobQueueRecv mgr.jobQueue
     match job? with
     | none => pure ()
     | some job =>
       try
-        match job with
-        | .load coord =>
-          if !(← isCanceled mgr coord) then
-            processLoad mgr coord
-        | .fetch coord =>
-          if !(← isCanceled mgr coord) then
-            fetchFromNetwork mgr coord true
-        | .decode coord bytes =>
-          if !(← isCanceled mgr coord) then
-            match ← decodeImage coord bytes with
-            | some img =>
-                let state := TileState.loaded img bytes
-                mgr.updateTileState coord state
-            | none =>
-                fetchFromNetwork mgr coord false
+        if (← mgr.isShutdownRef.get) then
+          pure ()
+        else if (← isCanceled mgr job.coord) then
+          pure ()
+        else if (← isPriorityStale mgr job.coord job.generation) then
+          pure ()
+        else
+          match job.kind with
+          | .load =>
+              processLoad mgr job.coord
+          | .fetch =>
+              fetchFromNetwork mgr job.coord true
+          | .decode bytes =>
+              match ← decodeImage job.coord bytes with
+              | some img =>
+                  let state := TileState.loaded img bytes
+                  mgr.updateTileState job.coord state
+              | none =>
+                  fetchFromNetwork mgr job.coord false
       catch e =>
         IO.eprintln s!"[Tileset] Worker error: {e}"
       loop
@@ -394,8 +570,10 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
   let inFlightRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord InFlight)
   let canceledRef ← SpiderM.liftIO <| IO.mkRef ({} : HashSet TileCoord)
+  let priorityRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord RequestInfo)
   let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
-  let workerQueue ← SpiderM.liftIO Std.CloseableChannel.Sync.new
+  let jobQueue ← SpiderM.liftIO jobQueueNew
+  let jobSeqRef ← SpiderM.liftIO <| IO.mkRef 0
   let isShutdownRef ← SpiderM.liftIO <| IO.mkRef false
   let shutdownPromise ← SpiderM.liftIO <| IO.Promise.new
   let mgr := {
@@ -406,8 +584,10 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     bindingsRef
     inFlightRef
     canceledRef
+    priorityRef
     frameCounterRef
-    workerQueue
+    jobQueue
+    jobSeqRef
     workerTasks := #[]
     isShutdownRef
     shutdownPromise
@@ -415,7 +595,7 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let workerTasks ← SpiderM.liftIO <| startWorkers mgr
   return { mgr with workerTasks := workerTasks }
 
-/-- Request a tile. Returns a Dynamic that updates when the tile's state changes.
+/-- Request a tile with explicit priority (higher = sooner).
 
     The returned Dynamic will emit:
     - `.loading` when the fetch starts
@@ -424,33 +604,58 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
 
     The tile is automatically fetched from the network or disk cache.
     Updates happen asynchronously - no polling required. -/
-def requestTile (mgr : TileManager) (coord : TileCoord)
+def requestTileWithPriority (mgr : TileManager) (coord : TileCoord) (priority : Int)
+    (generation : Nat := 0)
     : SpiderM (Dyn TileLoadState) := do
   let wasCanceled ← SpiderM.liftIO do
     let canceled ← mgr.canceledRef.get
     pure (canceled.contains coord)
   SpiderM.liftIO <| mgr.canceledRef.modify (·.erase coord)
+  let info ← SpiderM.liftIO <| upsertRequestInfo mgr coord priority generation
+  let shouldSchedule ← SpiderM.liftIO do
+    match info.lastScheduled with
+    | none => pure true
+    | some last => pure (last < info.generation)
   -- Check if we already have this tile
   let cache ← SpiderM.liftIO mgr.memoryCacheRef.get
   match cache.get coord with
   | some state =>
     -- Already have state, just return/create binding
     let binding ← mgr.getOrCreateBinding coord state.toLoadState
-    match state with
-    | .cached bytes _ =>
-        SpiderM.liftIO <| mgr.updateTileState coord .pending
-        SpiderM.liftIO <| enqueueJob mgr (TileJob.decode coord bytes)
-    | _ =>
-        if wasCanceled then
+    if shouldSchedule then
+      SpiderM.liftIO <| markScheduled mgr coord info.generation
+      match state with
+      | .cached bytes _ =>
           SpiderM.liftIO <| mgr.updateTileState coord .pending
-          SpiderM.liftIO <| enqueueJob mgr (TileJob.load coord)
+          SpiderM.liftIO <| enqueueJob mgr coord (.decode bytes) info.priority info.generation
+      | .failed _ | .exhausted _ =>
+          SpiderM.liftIO <| mgr.updateTileState coord .pending
+          SpiderM.liftIO <| enqueueJob mgr coord .load info.priority info.generation
+      | .pending | .retrying _ =>
+          let inflight ← SpiderM.liftIO mgr.inFlightRef.get
+          if inflight.contains coord then
+            pure ()
+          else
+            SpiderM.liftIO <| mgr.updateTileState coord .pending
+            SpiderM.liftIO <| enqueueJob mgr coord .load info.priority info.generation
+      | _ =>
+          if wasCanceled then
+            SpiderM.liftIO <| mgr.updateTileState coord .pending
+            SpiderM.liftIO <| enqueueJob mgr coord .load info.priority info.generation
     return binding.dynamic
   | none =>
     -- New tile request (enqueue background load)
     let binding ← mgr.getOrCreateBinding coord .loading
-    SpiderM.liftIO <| mgr.updateTileState coord .pending
-    SpiderM.liftIO <| enqueueJob mgr (TileJob.load coord)
+    if shouldSchedule then
+      SpiderM.liftIO <| markScheduled mgr coord info.generation
+      SpiderM.liftIO <| mgr.updateTileState coord .pending
+      SpiderM.liftIO <| enqueueJob mgr coord .load info.priority info.generation
     return binding.dynamic
+
+/-- Request a tile with default priority. -/
+def requestTile (mgr : TileManager) (coord : TileCoord)
+    : SpiderM (Dyn TileLoadState) :=
+  requestTileWithPriority mgr coord 0
 
 /-- Increment the frame counter. Call this once per frame for retry timing.
     Note: This is optional if you don't need frame-accurate retry timing. -/
@@ -462,6 +667,12 @@ def tick (mgr : TileManager) : IO Unit := do
 def evictDistant (mgr : TileManager) (keepSet : HashSet TileCoord) : IO Unit := do
   let frame ← mgr.frameCounterRef.get
   let cache ← mgr.memoryCacheRef.get
+
+  -- Drop priorities for tiles outside the keep set
+  let priorities ← mgr.priorityRef.get
+  let toDrop := priorities.toList.filter fun (coord, _) => !keepSet.contains coord
+  for (coord, _) in toDrop do
+    mgr.priorityRef.modify (·.erase coord)
 
   -- Find loaded tiles to unload (keep raw bytes)
   let toUnload := cache.tilesToUnload keepSet
@@ -497,11 +708,7 @@ def shutdown (mgr : TileManager) : IO Unit := do
   let inflight ← mgr.inFlightRef.get
   for (coord, _) in inflight.toList do
     cancelCoord mgr coord
-  try
-    let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
-    pure ()
-  catch _ =>
-    pure ()
+  jobQueueClose mgr.jobQueue
   for task in mgr.workerTasks do
     let _ := task.get
 
@@ -509,6 +716,11 @@ def shutdown (mgr : TileManager) : IO Unit := do
 def stats (mgr : TileManager) : IO (Nat × Nat × Nat) := do
   let cache ← mgr.memoryCacheRef.get
   return cache.stateCounts
+
+/-- Update request priority/generation without enqueuing work. -/
+def updateRequestInfo (mgr : TileManager) (coord : TileCoord) (priority : Int) (generation : Nat) : IO Unit := do
+  let _ ← upsertRequestInfo mgr coord priority generation
+  pure ()
 
 /-- Number of in-flight network requests. -/
 def inFlightCount (mgr : TileManager) : IO Nat := do
