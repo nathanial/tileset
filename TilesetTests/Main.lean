@@ -346,6 +346,87 @@ test "removeCoords removes tiles" := do
 end TilesetTests.Cache
 
 -- ============================================================================
+-- TileManager Tests
+-- ============================================================================
+
+namespace TilesetTests.Manager
+
+open Crucible
+open Tileset
+open Reactive.Host
+
+testSuite "TileManager"
+private def waitForReady (dyn : Dyn TileLoadState)
+    (timeoutMs : Nat := 2000) (stepMs : Nat := 20) : IO Bool := do
+  let stepMs := if stepMs == 0 then 1 else stepMs
+  let steps := timeoutMs / stepMs
+  let rec loop : Nat → IO Bool
+    | 0 => do
+        let state ← dyn.sample
+        match state with
+        | .ready _ => pure true
+        | .error msg => throw <| IO.userError s!"Unexpected tile error: {msg}"
+        | _ => pure false
+    | n + 1 => do
+        let state ← dyn.sample
+        match state with
+        | .ready _ => pure true
+        | .error msg => throw <| IO.userError s!"Unexpected tile error: {msg}"
+        | _ =>
+            IO.sleep stepMs.toUInt32
+            loop n
+  loop steps
+
+private def shutdownManager (mgr : TileManager) : IO Unit := do
+  let _ ← Std.CloseableChannel.Sync.close mgr.workerQueue
+  for task in mgr.workerTasks do
+    IO.cancel task
+  pure ()
+
+test "evictDistant preserves bytes in cached state" := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 2, y := 4, z := 6 }
+  let img := Raster.Image.create 2 2 .rgba [255, 0, 0, 255]
+  let bytes ← Raster.Image.encode img .png
+  let mgr ← (TileManager.new { workerCount := 1 }).run env
+  try
+    mgr.memoryCacheRef.modify (·.insert coord (TileState.loaded img bytes))
+    let keepSet : Std.HashSet TileCoord := {}
+    TileManager.evictDistant mgr keepSet
+    let cache ← mgr.memoryCacheRef.get
+    match cache.get coord with
+    | some (.cached cachedBytes _) => cachedBytes.size ≡ bytes.size
+    | _ => throw <| IO.userError "Expected cached state after eviction"
+  finally
+    shutdownManager mgr
+    env.currentScope.dispose
+
+test "cached tile rehydrates after eviction" := do
+  let env ← SpiderEnv.new
+  let coord : TileCoord := { x := 1, y := 2, z := 3 }
+  let img := Raster.Image.create 2 2 .rgba [0, 255, 0, 255]
+  let bytes ← Raster.Image.encode img .png
+  let mgr ← (TileManager.new { workerCount := 1 }).run env
+  try
+    mgr.memoryCacheRef.modify (·.insert coord (TileState.loaded img bytes))
+    let keepSet : Std.HashSet TileCoord := {}
+    TileManager.evictDistant mgr keepSet
+    let dyn ← (TileManager.requestTile mgr coord).run env
+    let ready ← waitForReady dyn
+    ensure ready "cached tile should decode to ready"
+    let finalState ← dyn.sample
+    match finalState with
+    | .ready readyImg => readyImg.width ≡ 2
+    | _ => throw <| IO.userError "Expected ready tile after decode"
+  finally
+    shutdownManager mgr
+    env.currentScope.dispose
+
+#generate_tests
+
+end TilesetTests.Manager
+
+-- ============================================================================
 -- MapBounds Tests
 -- ============================================================================
 

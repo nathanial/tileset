@@ -9,6 +9,7 @@
 -/
 import Std.Data.HashMap
 import Std.Data.HashSet
+import Std.Sync.Channel
 import Tileset.Coord
 import Tileset.Provider
 import Tileset.State
@@ -39,6 +40,8 @@ structure TileManagerConfig where
   unloadConfig : UnloadConfig := defaultUnloadConfig
   /-- HTTP client timeout in milliseconds -/
   httpTimeout : UInt64 := 30000
+  /-- Number of background workers for tile IO and decoding -/
+  workerCount : Nat := 4
   deriving Repr, Inhabited
 
 /-- Internal state for a tile's reactive binding -/
@@ -47,6 +50,11 @@ private structure TileBinding where
   dynamic : Dyn TileLoadState
   /-- Function to update the dynamic's value -/
   update : TileLoadState → IO Unit
+
+private inductive TileJob where
+  | load (coord : TileCoord)
+  | fetch (coord : TileCoord)
+  | decode (coord : TileCoord) (bytes : ByteArray)
 
 /-- The TileManager manages tile loading with reactive state -/
 structure TileManager where
@@ -63,26 +71,12 @@ structure TileManager where
   bindingsRef : IO.Ref (HashMap TileCoord TileBinding)
   /-- Current frame counter (for LRU tracking and retry timing) -/
   frameCounterRef : IO.Ref Nat
+  /-- Background job queue for tile IO/decoding -/
+  workerQueue : Std.CloseableChannel.Sync TileJob
+  /-- Background worker tasks -/
+  workerTasks : Array (Task (Except IO.Error Unit))
 
 namespace TileManager
-
-/-- Create a new TileManager.
-    Must be called within SpiderM to get the timeline context. -/
-def new (config : TileManagerConfig) : SpiderM TileManager := do
-  let httpClient := Wisp.HTTP.Client.new.withTimeout config.httpTimeout
-  let memoryCacheRef ← SpiderM.liftIO <| IO.mkRef MemoryCache.empty
-  let diskConfig := DiskCacheConfig.fromProvider config.provider config.diskCacheDir config.diskCacheMaxSize
-  let diskCacheIndexRef ← SpiderM.liftIO <| IO.mkRef (DiskCache.emptyIndex diskConfig)
-  let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
-  let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
-  return {
-    config
-    httpClient
-    memoryCacheRef
-    diskCacheIndexRef
-    bindingsRef
-    frameCounterRef
-  }
 
 /-- Internal: Create a TileBinding with a Dynamic -/
 private def createBinding (initial : TileLoadState) : SpiderM TileBinding := do
@@ -110,6 +104,19 @@ private def updateTileState (mgr : TileManager) (coord : TileCoord) (state : Til
   let bindings ← mgr.bindingsRef.get
   if let some binding := bindings[coord]? then
     binding.update state.toLoadState
+
+private def enqueueJob (mgr : TileManager) (job : TileJob) : IO Unit := do
+  let _ ← Std.CloseableChannel.Sync.send mgr.workerQueue job
+  pure ()
+
+private def decodeImage (coord : TileCoord) (bytes : ByteArray) : IO (Option Raster.Image) := do
+  try
+    let img ← Raster.Image.loadFromMemoryAs bytes .rgba
+    pure (some img)
+  catch e =>
+    IO.eprintln s!"[Tileset] Decode error for {coord}: {e}"
+    pure none
+
 
 /-- Internal: Try to load from disk cache -/
 private def tryDiskCache (mgr : TileManager) (coord : TileCoord) : IO (Option ByteArray) := do
@@ -163,7 +170,7 @@ partial def scheduleRetryCheck (mgr : TileManager) (coord : TileCoord) (rs : Ret
       match cache.get coord with
       | some (.failed currentRs) =>
         if currentRs == rs then  -- Still the same failure
-          startFetchAsync mgr coord true
+          enqueueJob mgr (TileJob.fetch coord)
         else
           pure ()
       | _ => pure ()  -- Tile state changed, skip retry
@@ -179,7 +186,7 @@ partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
     if response.status >= 200 && response.status < 300 then
       -- Success - decode the image
       try
-        let img ← Raster.Image.loadFromMemory response.body
+        let img ← Raster.Image.loadFromMemoryAs response.body .rgba
         let state := TileState.loaded img response.body
         mgr.updateTileState coord state
         -- Save to disk cache in background (fire and forget)
@@ -217,10 +224,9 @@ partial def handleFetchComplete (mgr : TileManager) (coord : TileCoord)
     let state := TileState.failed rs
     mgr.updateTileState coord state
     scheduleRetryCheck mgr coord rs
+end
 
-/-- Internal: Start an async fetch for a tile -/
-partial def startFetchAsync (mgr : TileManager) (coord : TileCoord) (wasRetry : Bool)
-    : IO Unit := do
+private def fetchFromNetwork (mgr : TileManager) (coord : TileCoord) (wasRetry : Bool) : IO Unit := do
   -- Mark as pending/retrying
   let cache ← mgr.memoryCacheRef.get
   let state := if wasRetry then
@@ -231,16 +237,76 @@ partial def startFetchAsync (mgr : TileManager) (coord : TileCoord) (wasRetry : 
     TileState.pending
   mgr.updateTileState coord state
 
-  -- Start HTTP request
+  -- Start HTTP request and wait for completion on this worker thread
   let url := mgr.config.provider.tileUrl coord
   let httpTask ← mgr.httpClient.get url
+  let result := httpTask.get
+  handleFetchComplete mgr coord result wasRetry
 
-  -- Spawn background task to handle completion
-  let _ ← (do
-    let result := httpTask.get  -- Block in background task
-    handleFetchComplete mgr coord result wasRetry
-  ).asTask
-end
+private def processLoad (mgr : TileManager) (coord : TileCoord) : IO Unit := do
+  -- Try disk cache first (off main thread)
+  if let some bytes ← tryDiskCache mgr coord then
+    if let some img ← decodeImage coord bytes then
+      let state := TileState.loaded img bytes
+      mgr.updateTileState coord state
+    else
+      -- Disk cache corrupted, fall through to network fetch
+      fetchFromNetwork mgr coord false
+  else
+    fetchFromNetwork mgr coord false
+
+private partial def workerLoop (mgr : TileManager) : IO Unit := do
+  let rec loop : IO Unit := do
+    let job? ← mgr.workerQueue.recv
+    match job? with
+    | none => pure ()
+    | some job =>
+      try
+        match job with
+        | .load coord => processLoad mgr coord
+        | .fetch coord => fetchFromNetwork mgr coord true
+        | .decode coord bytes =>
+          match ← decodeImage coord bytes with
+          | some img =>
+              let state := TileState.loaded img bytes
+              mgr.updateTileState coord state
+          | none =>
+              fetchFromNetwork mgr coord false
+      catch e =>
+        IO.eprintln s!"[Tileset] Worker error: {e}"
+      loop
+  loop
+
+private def startWorkers (mgr : TileManager) : IO (Array (Task (Except IO.Error Unit))) := do
+  let count := Nat.max 1 mgr.config.workerCount
+  let mut tasks := #[]
+  for _ in [:count] do
+    let worker ← (workerLoop mgr).asTask Task.Priority.dedicated
+    tasks := tasks.push worker
+  pure tasks
+
+/-- Create a new TileManager.
+    Must be called within SpiderM to get the timeline context. -/
+def new (config : TileManagerConfig) : SpiderM TileManager := do
+  let httpClient := Wisp.HTTP.Client.new.withTimeout config.httpTimeout
+  let memoryCacheRef ← SpiderM.liftIO <| IO.mkRef MemoryCache.empty
+  let diskConfig := DiskCacheConfig.fromProvider config.provider config.diskCacheDir config.diskCacheMaxSize
+  let diskCacheIndexRef ← SpiderM.liftIO <| IO.mkRef (DiskCache.emptyIndex diskConfig)
+  let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
+  let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
+  let workerQueue ← SpiderM.liftIO Std.CloseableChannel.Sync.new
+  let mgr := {
+    config
+    httpClient
+    memoryCacheRef
+    diskCacheIndexRef
+    bindingsRef
+    frameCounterRef
+    workerQueue
+    workerTasks := #[]
+  }
+  let workerTasks ← SpiderM.liftIO <| startWorkers mgr
+  return { mgr with workerTasks := workerTasks }
 
 /-- Request a tile. Returns a Dynamic that updates when the tile's state changes.
 
@@ -259,31 +325,17 @@ def requestTile (mgr : TileManager) (coord : TileCoord)
   | some state =>
     -- Already have state, just return/create binding
     let binding ← mgr.getOrCreateBinding coord state.toLoadState
+    match state with
+    | .cached bytes _ =>
+        SpiderM.liftIO <| mgr.updateTileState coord .pending
+        SpiderM.liftIO <| enqueueJob mgr (TileJob.decode coord bytes)
+    | _ => pure ()
     return binding.dynamic
   | none =>
-    -- New tile request
-    -- Try disk cache first
-    if let some bytes ← SpiderM.liftIO (mgr.tryDiskCache coord) then
-      let decoded? ← SpiderM.liftIO do
-        try
-          let img ← Raster.Image.loadFromMemory bytes
-          pure (some img)
-        catch e =>
-          -- Disk cache corrupted, fall through to network fetch
-          IO.eprintln s!"[Tileset] Disk cache decode error for {coord}: {e}"
-          pure none
-      if let some img := decoded? then
-        let state := TileState.loaded img bytes
-        SpiderM.liftIO <| mgr.updateTileState coord state
-        let binding ← mgr.getOrCreateBinding coord state.toLoadState
-        return binding.dynamic
-
-    -- Create binding with loading state
+    -- New tile request (enqueue background load)
     let binding ← mgr.getOrCreateBinding coord .loading
-
-    -- Start async fetch (non-blocking)
-    SpiderM.liftIO <| mgr.startFetchAsync coord false
-
+    SpiderM.liftIO <| mgr.updateTileState coord .pending
+    SpiderM.liftIO <| enqueueJob mgr (TileJob.load coord)
     return binding.dynamic
 
 /-- Increment the frame counter. Call this once per frame for retry timing.
@@ -304,19 +356,18 @@ def evictDistant (mgr : TileManager) (keepSet : HashSet TileCoord) : IO Unit := 
     mgr.updateTileState coord state
 
   -- Find stale tiles to remove completely
-  let stale := cache.staleTiles keepSet
-  let cache' := cache.removeCoords stale
-  mgr.memoryCacheRef.set cache'
+  let cacheAfterUnload ← mgr.memoryCacheRef.get
+  let stale := cacheAfterUnload.staleTiles keepSet
+  mgr.memoryCacheRef.modify (·.removeCoords stale)
 
   -- Remove bindings for stale tiles
   for coord in stale do
     mgr.bindingsRef.modify (·.erase coord)
 
   -- Evict oldest cached tiles if over limit
-  let cache'' ← mgr.memoryCacheRef.get
-  let toEvict := cache''.cachedToEvict keepSet mgr.config.unloadConfig.maxLoadedImages
-  let cache''' := cache''.removeCoords toEvict
-  mgr.memoryCacheRef.set cache'''
+  let cache' ← mgr.memoryCacheRef.get
+  let toEvict := cache'.cachedToEvict keepSet mgr.config.unloadConfig.maxLoadedImages
+  mgr.memoryCacheRef.modify (·.removeCoords toEvict)
 
   for coord in toEvict do
     mgr.bindingsRef.modify (·.erase coord)
