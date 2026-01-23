@@ -41,8 +41,6 @@ test "ancestorAt steps to target zoom" := do
   TileCoord.ancestorAt coord 2 ≡ { x := 2, y := 3, z := 2 : TileCoord }
   TileCoord.ancestorAt coord 1 ≡ { x := 1, y := 1, z := 1 : TileCoord }
 
-#generate_tests
-
 end TilesetTests.Coord
 
 -- ============================================================================
@@ -82,8 +80,6 @@ test "tilesAtZoom is 2^zoom" := do
   (tilesAtZoom 1) ≡ 2
   (tilesAtZoom 2) ≡ 4
   (tilesAtZoom 10) ≡ 1024
-
-#generate_tests
 
 end TilesetTests.Projection
 
@@ -125,8 +121,6 @@ test "clampZoom respects provider limits" := do
   (provider.clampZoom 20) ≡ 16
   (provider.clampZoom 10) ≡ 10
   (provider.clampZoom (-1)) ≡ 0
-
-#generate_tests
 
 end TilesetTests.Provider
 
@@ -176,8 +170,6 @@ test "shouldRetry respects backoff timing" := do
   ensure (not (state.shouldRetry config 150)) "should not retry before backoff"
   -- At time 160 (60 frames later), should retry
   ensure (state.shouldRetry config 160) "should retry after backoff"
-
-#generate_tests
 
 end TilesetTests.Retry
 
@@ -263,8 +255,6 @@ test "centerTilePos returns fractional position" := do
   ensure (x > 1.9 && x < 2.1) "x should be approximately 2.0"
   ensure (y > 1.9 && y < 2.1) "y should be approximately 2.0"
 
-#generate_tests
-
 end TilesetTests.Viewport
 
 -- ============================================================================
@@ -309,8 +299,6 @@ test "getImage? returns none for pending" := do
   match state.getImage? with
   | none => pure ()
   | some _ => throw <| IO.userError "Expected none"
-
-#generate_tests
 
 end TilesetTests.State
 
@@ -389,8 +377,6 @@ test "removeCoords removes tiles" := do
   let cache' := cache.removeCoords [{ x := 1, y := 1, z := 1 }, { x := 3, y := 3, z := 3 }]
   cache'.size ≡ 1
   ensure (cache'.contains { x := 2, y := 2, z := 2 }) "cache should contain remaining coord"
-
-#generate_tests
 
 end TilesetTests.Cache
 
@@ -496,8 +482,6 @@ test "disk cache hit avoids network fetch" := do
   finally
     shutdownManager mgr
     env.currentScope.dispose
-
-#generate_tests
 
 end TilesetTests.Manager
 
@@ -664,8 +648,6 @@ test "re-request clears canceled flag" (timeout := 10000) := do
     TilesetTests.Manager.shutdownManager mgr
     env.currentScope.dispose
 
-#generate_tests
-
 end TilesetTests.ManagerNetwork
 
 -- ============================================================================
@@ -693,8 +675,6 @@ test "clampZoom respects bounds" := do
   (bounds.clampZoom 1) ≡ 3  -- USA has minZoom 3
   (bounds.clampZoom 25) ≡ 19  -- USA has maxZoom 19
   (bounds.clampZoom 10) ≡ 10
-
-#generate_tests
 
 end TilesetTests.Bounds
 
