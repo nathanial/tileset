@@ -19,7 +19,8 @@ import Tileset.Coord
 import Tileset.Provider
 import Tileset.State
 import Tileset.Cache
-import Tileset.Retry
+import Reactive.Core.Retry
+import Reactive.Host.Spider.Async
 import Raster
 import Wisp
 import Reactive
@@ -27,9 +28,8 @@ import Reactive
 namespace Tileset
 
 open Std (HashMap HashSet)
-open Reactive (Dynamic Event)
+open Reactive (Dynamic Event RetryConfig RetryState)
 open Reactive.Host
-open Retry (RetryConfig RetryState)
 
 /-- Configuration for the TileManager -/
 structure TileManagerConfig where
@@ -40,7 +40,7 @@ structure TileManagerConfig where
   /-- Maximum disk cache size in bytes -/
   diskCacheMaxSize : Nat := 2000 * 1024 * 1024  -- 2 GB
   /-- Retry configuration -/
-  retryConfig : RetryConfig := Retry.defaultRetryConfig
+  retryConfig : RetryConfig := RetryConfig.default
   /-- Unload configuration -/
   unloadConfig : UnloadConfig := defaultUnloadConfig
   /-- HTTP client timeout in milliseconds -/
@@ -126,8 +126,10 @@ structure TileManager where
   poolHandle : WorkerPool.PoolHandle
   /-- Pool running count dynamic -/
   runningCountDyn : Dyn Nat
-  /-- Retry state per tile (tracks retry counts for exponential backoff) -/
-  retryStateRef : IO.Ref (HashMap TileCoord RetryState)
+  /-- Retry scheduler (handles exponential backoff automatically) -/
+  retryScheduler : RetryScheduler TileCoord
+  /-- Fire application-level errors to retry scheduler -/
+  fireAppError : TileCoord × String → IO Unit
   /-- Canceled tiles (skip queued work until re-requested) -/
   canceledRef : IO.Ref (HashSet TileCoord)
   /-- Shutdown flag -/
@@ -232,44 +234,14 @@ private def isNetworkError (msg : String) : Bool :=
   msg.startsWith "SSL:" ||
   msg.startsWith "HTTP 5"  -- Server errors are retryable
 
-/-- Internal: Schedule a retry for a failed tile -/
-private def scheduleRetry (mgr : TileManager) (coord : TileCoord) (errorMsg : String)
-    : IO Unit := do
-  if ← mgr.isShutdownRef.get then return
-  let frame ← mgr.frameCounterRef.get
-  let retryStates ← mgr.retryStateRef.get
-  let rs := match retryStates[coord]? with
-    | some existing => existing.recordRetryFailure frame errorMsg
-    | none => RetryState.initialFailure frame errorMsg
-  mgr.retryStateRef.modify (·.insert coord rs)
-
-  if rs.isExhausted mgr.config.retryConfig then
-    -- Mark as exhausted
-    updateTileState mgr coord (.exhausted rs)
-  else
-    -- Schedule retry after backoff delay
-    let delayMs := rs.backoffDelay mgr.config.retryConfig * 16  -- ~16ms per frame at 60fps
-    let retryAction : IO Unit := do
-      IO.sleep (UInt32.ofNat delayMs)
-      if ← mgr.isShutdownRef.get then return
-      -- Check if tile is still in failed/retrying state
-      let cache ← mgr.memoryCacheRef.get
-      match cache.get coord with
-      | some (.failed _) | some (.retrying _) =>
-        -- Resubmit the fetch job
-        mgr.fireCommand (.resubmit coord (.fetch coord) 0)
-      | _ => pure ()  -- Tile state changed, skip retry
-    let _ ← retryAction.asTask
-    -- Mark as retrying
-    updateTileState mgr coord (.retrying rs)
-
-/-- Handle completed tile job results -/
+/-- Handle completed tile job results.
+    Network errors are forwarded to the retry scheduler via fireAppError.
+    Non-retryable errors are marked as exhausted immediately. -/
 private def handleJobResult (mgr : TileManager) (coord : TileCoord) (_job : TileJob)
     (result : TileResult) : IO Unit := do
   match result with
   | .decoded img bytes =>
-    -- Final state: update memory cache and clear retry state
-    mgr.retryStateRef.modify (·.erase coord)
+    -- Final state: loaded successfully
     updateTileState mgr coord (.loaded img bytes)
 
   | .diskHit _ | .cacheMiss | .fetched _ =>
@@ -278,22 +250,13 @@ private def handleJobResult (mgr : TileManager) (coord : TileCoord) (_job : Tile
 
   | .error msg =>
     if isNetworkError msg then
-      scheduleRetry mgr coord msg
+      -- Forward to retry scheduler (it will handle backoff and resubmit)
+      mgr.fireAppError (coord, msg)
     else
-      -- Non-retryable error
-      let frame ← mgr.frameCounterRef.get
-      let rs := RetryState.initialFailure frame msg
+      -- Non-retryable error - mark as exhausted immediately
+      let now ← IO.monoMsNow
+      let rs := RetryState.initialFailure now msg
       updateTileState mgr coord (.exhausted rs)
-
-/-- Handle job errors from the pool -/
-private def handleJobError (mgr : TileManager) (coord : TileCoord) (errMsg : String)
-    : IO Unit := do
-  if isNetworkError errMsg then
-    scheduleRetry mgr coord errMsg
-  else
-    let frame ← mgr.frameCounterRef.get
-    let rs := RetryState.initialFailure frame errMsg
-    updateTileState mgr coord (.exhausted rs)
 
 /-- Create the ChainableProcessor for tile jobs -/
 private def mkTileProcessor (config : TileManagerConfig) (httpClient : Wisp.HTTP.Client)
@@ -382,7 +345,6 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let diskCacheIndexRef ← SpiderM.liftIO <| IO.mkRef (DiskCache.emptyIndex diskConfig)
   let bindingsRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord TileBinding)
   let frameCounterRef ← SpiderM.liftIO <| IO.mkRef 0
-  let retryStateRef ← SpiderM.liftIO <| IO.mkRef ({} : HashMap TileCoord RetryState)
   let canceledRef ← SpiderM.liftIO <| IO.mkRef ({} : HashSet TileCoord)
   let isShutdownRef ← SpiderM.liftIO <| IO.mkRef false
 
@@ -395,7 +357,25 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
   let poolConfig : WorkerPoolConfig := { workerCount := config.workerCount }
   let (poolOutput, poolHandle) ← WorkerPool.fromCommandsChainable poolConfig processor commandEvt
 
-  -- Build the manager
+  -- Create application-level error event for retry scheduler
+  -- (handles TileResult.error from completed jobs, not just thrown exceptions)
+  let (appErrorEvt, fireAppError) ← Reactive.newTriggerEvent (t := Spider)
+    (a := TileCoord × String)
+
+  -- Merge pool errors with application errors for unified retry handling
+  let allErrors ← Event.mergeM poolOutput.errored appErrorEvt
+
+  -- Create retry scheduler using the Reactive library combinator
+  let retryScheduler ← withRetryScheduling
+    config.retryConfig
+    (fun (_, msg) => isNetworkError msg)  -- Only retry network errors
+    (fun coord => TileJob.fetch coord)     -- Recreate fetch job for retry
+    { poolOutput with errored := allErrors }  -- Use merged error stream
+    fireCommand
+
+  -- Build the manager (note: we need mgr ref for subscriptions, use partial init)
+  let mgrRef ← SpiderM.liftIO <| IO.mkRef (none : Option TileManager)
+
   let mgr : TileManager := {
     config
     httpClient
@@ -406,18 +386,28 @@ def new (config : TileManagerConfig) : SpiderM TileManager := do
     fireCommand
     poolHandle
     runningCountDyn := poolOutput.runningCount
-    retryStateRef
+    retryScheduler
+    fireAppError
     canceledRef
     isShutdownRef
   }
 
-  -- Subscribe to completed results
+  SpiderM.liftIO <| mgrRef.set (some mgr)
+
+  -- Subscribe to completed results (forwards errors to retry scheduler via fireAppError)
   let _ ← poolOutput.completed.subscribe fun (coord, job, result) =>
     handleJobResult mgr coord job result
 
-  -- Subscribe to errors
-  let _ ← poolOutput.errored.subscribe fun (coord, errMsg) =>
-    handleJobError mgr coord errMsg
+  -- Subscribe to retry scheduler events for UI state updates
+  let _ ← retryScheduler.retryScheduled.subscribe fun (coord, delayMs) => do
+    let now ← IO.monoMsNow
+    let rs : RetryState := { lastAttemptTime := now, lastError := some s!"Retrying in {delayMs}ms" }
+    updateTileState mgr coord (.retrying rs)
+
+  let _ ← retryScheduler.exhausted.subscribe fun (coord, errMsg) => do
+    let now ← IO.monoMsNow
+    let rs := RetryState.initialFailure now errMsg
+    updateTileState mgr coord (.exhausted rs)
 
   -- Subscribe to cancelled jobs to track in canceledRef
   let _ ← poolOutput.cancelled.subscribe fun coord =>
@@ -496,9 +486,9 @@ def evictDistant (mgr : TileManager) (keepSet : HashSet TileCoord) : IO Unit := 
   let cacheAfterUnload ← mgr.memoryCacheRef.get
   let stale := cacheAfterUnload.staleTiles keepSet
   for coord in stale do
-    -- Cancel any in-progress work via pool command
+    -- Cancel any in-progress work via pool command and retry scheduler
     mgr.fireCommand (.cancel coord)
-    mgr.retryStateRef.modify (·.erase coord)
+    mgr.retryScheduler.cancelRetry coord
     mgr.bindingsRef.modify (·.erase coord)
   mgr.memoryCacheRef.modify (·.removeCoords stale)
 

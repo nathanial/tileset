@@ -15,7 +15,7 @@ import Cellar
 namespace Tileset
 
 open Std (HashMap HashSet)
-open Retry (RetryConfig RetryState)
+open Reactive (RetryConfig)
 
 -- ============================================================================
 -- Memory Cache
@@ -24,13 +24,13 @@ open Retry (RetryConfig RetryState)
 /-- In-memory tile cache using HashMap -/
 structure MemoryCache where
   tiles : HashMap TileCoord TileState
-  retryConfig : RetryConfig := Retry.defaultRetryConfig
+  retryConfig : RetryConfig := RetryConfig.default
   unloadConfig : UnloadConfig := defaultUnloadConfig
   deriving Inhabited
 
 namespace MemoryCache
 
-def empty : MemoryCache := { tiles := {} }
+def empty : MemoryCache := { tiles := {}, retryConfig := RetryConfig.default }
 
 def get (cache : MemoryCache) (coord : TileCoord) : Option TileState :=
   cache.tiles[coord]?

@@ -5,12 +5,12 @@
   GPU textures. Consumers can upload images to GPU textures as needed.
 -/
 import Tileset.Coord
-import Tileset.Retry
+import Reactive.Core.Retry
 import Raster
 
 namespace Tileset
 
-open Retry (RetryConfig RetryState)
+open Reactive (RetryConfig RetryState)
 
 /-- Consumer-facing tile load state (what external code sees).
     This is a simple enum without internal retry details. -/
@@ -72,7 +72,7 @@ def toLoadState (state : TileState) : TileLoadState :=
   | .cached _ _ => .loading  -- Will be decoded soon
   | .failed _ => .loading    -- Will retry soon
   | .retrying _ => .loading
-  | .exhausted rs => .error rs.errorMessage
+  | .exhausted rs => .error (rs.lastError.getD "Unknown error")
 
 /-- Check if the tile is currently being loaded (fetch or retry in flight) -/
 def isLoading (state : TileState) : Bool :=

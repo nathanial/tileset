@@ -132,44 +132,46 @@ namespace TilesetTests.Retry
 
 open Crucible
 open Tileset
+open Reactive (RetryConfig RetryState)
 
 testSuite "RetryLogic"
 
 test "initial failure has zero retry count" := do
-  let state := Retry.RetryState.initialFailure 100
+  let state := RetryState.initialFailure 100 "test error"
   state.retryCount ≡ 0
-  state.lastFailTime ≡ 100
+  state.lastAttemptTime ≡ 100
 
 test "recordRetryFailure increments count" := do
-  let state := Retry.RetryState.initialFailure 100
-  let state' := state.recordRetryFailure 200
+  let state := RetryState.initialFailure 100 "test error"
+  let state' := state.recordRetryFailure 200 "retry error"
   state'.retryCount ≡ 1
-  state'.lastFailTime ≡ 200
+  state'.lastAttemptTime ≡ 200
 
 test "isExhausted after max retries" := do
-  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
-  let state := Retry.RetryState.initialFailure 0
-    |>.recordRetryFailure 100
-    |>.recordRetryFailure 200
-    |>.recordRetryFailure 300
+  let config : RetryConfig := { maxRetries := 3, baseDelayMs := 1000 }
+  let state := RetryState.initialFailure 0 "error"
+    |>.recordRetryFailure 100 "error"
+    |>.recordRetryFailure 200 "error"
+    |>.recordRetryFailure 300 "error"
   ensure (state.isExhausted config) "state should be exhausted after max retries"
 
-test "backoffDelay is exponential" := do
-  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
-  let s0 := Retry.RetryState.initialFailure 0
-  let s1 := s0.recordRetryFailure 100
-  let s2 := s1.recordRetryFailure 200
-  (s0.backoffDelay config) ≡ 60   -- 60 * 2^0
-  (s1.backoffDelay config) ≡ 120  -- 60 * 2^1
-  (s2.backoffDelay config) ≡ 240  -- 60 * 2^2
+test "backoffDelayMs is exponential" := do
+  let config : RetryConfig := { maxRetries := 3, baseDelayMs := 1000 }
+  let s0 := RetryState.initialFailure 0 "error"
+  let s1 := s0.recordRetryFailure 100 "error"
+  let s2 := s1.recordRetryFailure 200 "error"
+  (s0.backoffDelayMs config) ≡ 1000   -- 1000 * 2^0
+  (s1.backoffDelayMs config) ≡ 2000   -- 1000 * 2^1
+  (s2.backoffDelayMs config) ≡ 4000   -- 1000 * 2^2
 
-test "shouldRetry respects backoff timing" := do
-  let config : Retry.RetryConfig := { maxRetries := 3, baseDelay := 60 }
-  let state := Retry.RetryState.initialFailure 100
-  -- At time 150 (only 50 frames later), should not retry yet
-  ensure (not (state.shouldRetry config 150)) "should not retry before backoff"
-  -- At time 160 (60 frames later), should retry
-  ensure (state.shouldRetry config 160) "should retry after backoff"
+test "canRetry while retries remain" := do
+  let config : RetryConfig := { maxRetries := 3, baseDelayMs := 1000 }
+  let state := RetryState.initialFailure 100 "error"
+  ensure (state.canRetry config) "should be able to retry initially"
+  let state' := state.recordRetryFailure 200 "error"
+    |>.recordRetryFailure 300 "error"
+    |>.recordRetryFailure 400 "error"
+  ensure (not (state'.canRetry config)) "should not retry after max retries"
 
 end TilesetTests.Retry
 
@@ -183,9 +185,17 @@ open Crucible
 open Tileset
 open Std (HashSet)
 
+private def wrappedTileX (centerX : Float) (tilesPerAxis : Float) (tileX : Float) : Float :=
+  let candidates := #[tileX - tilesPerAxis, tileX, tileX + tilesPerAxis]
+  candidates.foldl (fun best c =>
+    if Float.abs (c - centerX) < Float.abs (best - centerX) then c else best
+  ) tileX
+
 private def tileTopLeft (vp : MapViewport) (tile : TileCoord) : (Float × Float) :=
   let (centerX, centerY) := vp.centerTilePos
-  let offsetX := (intToFloat tile.x - centerX) * (intToFloat vp.tileSize) +
+  let tilesPerAxis := intToFloat (tilesAtZoom vp.zoom)
+  let tileX := wrappedTileX centerX tilesPerAxis (intToFloat tile.x)
+  let offsetX := (tileX - centerX) * (intToFloat vp.tileSize) +
     (intToFloat vp.screenWidth) / 2.0
   let offsetY := (intToFloat tile.y - centerY) * (intToFloat vp.tileSize) +
     (intToFloat vp.screenHeight) / 2.0
@@ -345,9 +355,8 @@ test "loaded converts to ready" := do
   | _ => throw <| IO.userError "Expected ready state"
 
 test "exhausted converts to error" := do
-  let rs := Retry.RetryState.initialFailure 0
-  let rs' := { rs with errorMessage := "test error" }
-  let state := TileState.exhausted rs'
+  let rs := Reactive.RetryState.initialFailure 0 "test error"
+  let state := TileState.exhausted rs
   match state.toLoadState with
   | .error msg => msg ≡ "test error"
   | _ => throw <| IO.userError "Expected error state"
@@ -530,7 +539,7 @@ test "disk cache hit avoids network fetch" := do
     provider := TileProvider.openStreetMap
     diskCacheDir := cacheDir
     httpTimeout := 1000
-    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    retryConfig := { maxRetries := 0, baseDelayMs := 100 }
     workerCount := 1
   }
   let diskConfig := DiskCacheConfig.fromProvider config.provider cacheDir config.diskCacheMaxSize
@@ -595,7 +604,7 @@ test "network tile loads" (timeout := 20000) := do
     provider := TileProvider.openStreetMap
     diskCacheDir := cacheDir
     httpTimeout := 10000
-    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    retryConfig := { maxRetries := 0, baseDelayMs := 100 }
     workerCount := 2
   }
   let mgr ← (TileManager.new config).run env
@@ -622,7 +631,7 @@ test "network tile writes disk cache" (timeout := 20000) := do
     provider := TileProvider.openStreetMap
     diskCacheDir := cacheDir
     httpTimeout := 10000
-    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    retryConfig := { maxRetries := 0, baseDelayMs := 100 }
     workerCount := 2
   }
   let diskConfig := DiskCacheConfig.fromProvider config.provider cacheDir config.diskCacheMaxSize
@@ -652,7 +661,7 @@ test "evict cancels pending tile" (timeout := 10000) := do
   let config : TileManagerConfig := {
     provider := slowProvider
     httpTimeout := 60000
-    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    retryConfig := { maxRetries := 0, baseDelayMs := 100 }
     workerCount := 1
   }
   let mgr ← (TileManager.new config).run env
@@ -690,7 +699,7 @@ test "re-request clears canceled flag" (timeout := 10000) := do
   let config : TileManagerConfig := {
     provider := slowProvider
     httpTimeout := 60000
-    retryConfig := { maxRetries := 0, baseDelay := 1 }
+    retryConfig := { maxRetries := 0, baseDelayMs := 100 }
     workerCount := 1
   }
   let mgr ← (TileManager.new config).run env
