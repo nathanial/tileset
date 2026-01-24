@@ -181,6 +181,38 @@ namespace TilesetTests.Viewport
 
 open Crucible
 open Tileset
+open Std (HashSet)
+
+private def tileTopLeft (vp : MapViewport) (tile : TileCoord) : (Float × Float) :=
+  let (centerX, centerY) := vp.centerTilePos
+  let offsetX := (intToFloat tile.x - centerX) * (intToFloat vp.tileSize) +
+    (intToFloat vp.screenWidth) / 2.0
+  let offsetY := (intToFloat tile.y - centerY) * (intToFloat vp.tileSize) +
+    (intToFloat vp.screenHeight) / 2.0
+  (offsetX, offsetY)
+
+private def tileIntersectsViewport (vp : MapViewport) (buffer : Int) (tile : TileCoord) : Bool :=
+  let (x, y) := tileTopLeft vp tile
+  let tileSize := intToFloat vp.tileSize
+  let bufferPx := intToFloat buffer * tileSize
+  let viewLeft := -bufferPx
+  let viewTop := -bufferPx
+  let viewRight := (intToFloat vp.screenWidth) + bufferPx
+  let viewBottom := (intToFloat vp.screenHeight) + bufferPx
+  let tileRight := x + tileSize
+  let tileBottom := y + tileSize
+  tileRight > viewLeft && x < viewRight && tileBottom > viewTop && y < viewBottom
+
+private def expectedVisibleTiles (vp : MapViewport) (buffer : Int) : HashSet TileCoord :=
+  let count := (tilesAtZoom vp.zoom).toNat
+  Id.run do
+    let mut set : HashSet TileCoord := {}
+    for y in [0:count] do
+      for x in [0:count] do
+        let tile : TileCoord := { x := natToInt x, y := natToInt y, z := vp.zoom }
+        if tileIntersectsViewport vp buffer tile then
+          set := set.insert tile
+    return set
 
 testSuite "Viewport"
 
@@ -254,6 +286,39 @@ test "centerTilePos returns fractional position" := do
   -- At lat=0, lon=0, zoom=2: should be center of 4x4 grid
   ensure (x > 1.9 && x < 2.1) "x should be approximately 2.0"
   ensure (y > 1.9 && y < 2.1) "y should be approximately 2.0"
+
+test "visibleTilesWithBuffer excludes tiles outside viewport (buffer 0)" := do
+  let vp : MapViewport := {
+    centerLat := 0.0
+    centerLon := 0.0
+    zoom := 2
+    screenWidth := 512
+    screenHeight := 512
+    tileSize := 256
+  }
+  let tiles := vp.visibleTilesWithBuffer 0
+  for tile in tiles do
+    ensure (tileIntersectsViewport vp 0 tile)
+      s!"tile {tile} should intersect viewport"
+
+test "visibleTilesWithBuffer matches geometric coverage (buffer 1)" := do
+  let vp : MapViewport := {
+    centerLat := 37.7749
+    centerLon := -122.4194
+    zoom := 3
+    screenWidth := 800
+    screenHeight := 600
+    tileSize := 256
+  }
+  let expected := expectedVisibleTiles vp 1
+  let actual : HashSet TileCoord :=
+    (vp.visibleTilesWithBuffer 1).foldl (fun s t => s.insert t) {}
+  for tile in expected.toList do
+    ensure (actual.contains tile)
+      s!"missing tile {tile} in visible set"
+  for tile in actual.toList do
+    ensure (expected.contains tile)
+      s!"extra tile {tile} outside viewport coverage"
 
 end TilesetTests.Viewport
 

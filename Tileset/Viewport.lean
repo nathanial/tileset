@@ -23,48 +23,67 @@ structure MapViewport where
 
 namespace MapViewport
 
+private def floatFloorInt (v : Float) : Int :=
+  if v >= 0.0 then
+    natToInt v.floor.toUInt64.toNat
+  else
+    -natToInt ((-v).ceil.toUInt64.toNat)
+
+private def floatCeilInt (v : Float) : Int :=
+  if v >= 0.0 then
+    natToInt v.ceil.toUInt64.toNat
+  else
+    -natToInt ((-v).floor.toUInt64.toNat)
+
+/-- Calculate fractional tile position for the center -/
+def centerTilePos (vp : MapViewport) : (Float × Float) :=
+  let n := Float.pow 2.0 (intToFloat vp.zoom)
+  let centerX := (vp.centerLon + 180.0) / 360.0 * n
+  let latRad := vp.centerLat * pi / 180.0
+  let centerY := (1.0 - Float.log (Float.tan latRad + 1.0 / Float.cos latRad) / pi) / 2.0 * n
+  (centerX, centerY)
+
+/-- Calculate visible tiles plus a configurable buffer zone. -/
+def visibleTilesWithBuffer (vp : MapViewport) (buffer : Int) : List TileCoord :=
+  let (centerX, centerY) := vp.centerTilePos
+  let halfWidth := (intToFloat vp.screenWidth) / (intToFloat vp.tileSize) / 2.0
+  let halfHeight := (intToFloat vp.screenHeight) / (intToFloat vp.tileSize) / 2.0
+  let bufferTiles := intToFloat buffer
+  let left := centerX - halfWidth - bufferTiles
+  let right := centerX + halfWidth + bufferTiles
+  let top := centerY - halfHeight - bufferTiles
+  let bottom := centerY + halfHeight + bufferTiles
+  let minX := floatFloorInt left
+  let maxX := floatCeilInt right - 1
+  let minYRaw := floatFloorInt top
+  let maxYRaw := floatCeilInt bottom - 1
+  let maxTile := tilesAtZoom vp.zoom - 1
+  let minY := intMax 0 minYRaw
+  let maxY := intMin maxTile maxYRaw
+  if minY > maxY then
+    []
+  else
+    let spanX := maxX - minX + 1
+    if spanX <= 0 then
+      []
+    else
+      let spanXNat := spanX.toNat
+      let spanYNat := (maxY - minY + 1).toNat
+      let result := Id.run do
+        let mut tiles : List TileCoord := []
+        for dy in [0:spanYNat] do
+          let y := minY + natToInt dy
+          for dx in [0:spanXNat] do
+            let x := minX + natToInt dx
+            let x := x % (maxTile + 1)
+            let x := if x < 0 then x + maxTile + 1 else x
+            tiles := { x := x, y := y, z := vp.zoom } :: tiles
+        return tiles
+      result
+
 /-- Calculate which tiles are visible in the current viewport -/
 def visibleTiles (vp : MapViewport) : List TileCoord :=
-  let center := latLonToTile { lat := vp.centerLat, lon := vp.centerLon } vp.zoom
-  let tilesX := (vp.screenWidth / vp.tileSize + 2) / 2 + 1
-  let tilesY := (vp.screenHeight / vp.tileSize + 2) / 2 + 1
-  let maxTile := tilesAtZoom vp.zoom - 1
-
-  let result := Id.run do
-    let mut tiles : List TileCoord := []
-    for dy in [0:((tilesY * 2 + 1).toNat)] do
-      for dx in [0:((tilesX * 2 + 1).toNat)] do
-        let dxOffset := natToInt dx - tilesX
-        let dyOffset := natToInt dy - tilesY
-        let x := (center.x + dxOffset) % (maxTile + 1)
-        let x := if x < 0 then x + maxTile + 1 else x
-        let y := center.y + dyOffset
-        -- Only include tiles within valid y range
-        if y >= 0 && y <= maxTile then
-          tiles := { x := x, y := y, z := vp.zoom } :: tiles
-    return tiles
-  result
-
-/-- Calculate visible tiles plus a configurable buffer zone -/
-def visibleTilesWithBuffer (vp : MapViewport) (buffer : Int) : List TileCoord :=
-  let center := latLonToTile { lat := vp.centerLat, lon := vp.centerLon } vp.zoom
-  let tilesX := (vp.screenWidth / vp.tileSize + 2) / 2 + 1 + buffer
-  let tilesY := (vp.screenHeight / vp.tileSize + 2) / 2 + 1 + buffer
-  let maxTile := tilesAtZoom vp.zoom - 1
-
-  let result := Id.run do
-    let mut tiles : List TileCoord := []
-    for dy in [0:((tilesY * 2 + 1).toNat)] do
-      for dx in [0:((tilesX * 2 + 1).toNat)] do
-        let dxOffset := natToInt dx - tilesX
-        let dyOffset := natToInt dy - tilesY
-        let x := (center.x + dxOffset) % (maxTile + 1)
-        let x := if x < 0 then x + maxTile + 1 else x
-        let y := center.y + dyOffset
-        if y >= 0 && y <= maxTile then
-          tiles := { x := x, y := y, z := vp.zoom } :: tiles
-    return tiles
-  result
+  vp.visibleTilesWithBuffer 0
 
 /-- Create a HashSet of tiles to keep for efficient lookup -/
 def visibleTileSet (vp : MapViewport) (buffer : Int) : HashSet TileCoord :=
@@ -114,14 +133,6 @@ def visibleTileSetWithFallbackDepths (vp : MapViewport) (buffer : Int)
         set := set.insert t
       childLevel := next
     return set
-
-/-- Calculate fractional tile position for the center -/
-def centerTilePos (vp : MapViewport) : (Float × Float) :=
-  let n := Float.pow 2.0 (intToFloat vp.zoom)
-  let centerX := (vp.centerLon + 180.0) / 360.0 * n
-  let latRad := vp.centerLat * pi / 180.0
-  let centerY := (1.0 - Float.log (Float.tan latRad + 1.0 / Float.cos latRad) / pi) / 2.0 * n
-  (centerX, centerY)
 
 /-- Calculate screen position for a tile -/
 def tileScreenPos (vp : MapViewport) (tile : TileCoord) : (Int × Int) :=
