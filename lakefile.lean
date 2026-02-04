@@ -5,12 +5,11 @@ package tileset where
   version := v!"0.1.0"
   precompileModules := true
 
--- Dependencies (using local paths for development)
-require cellar from "../cellar"
-require wisp from "../../network/wisp"
-require raster from "../../graphics/raster"
-require reactive from "../reactive"
-require crucible from "../../testing/crucible"
+require cellar from git "https://github.com/nathanial/cellar" @ "v0.0.2"
+require wisp from git "https://github.com/nathanial/wisp" @ "v0.0.2"
+require raster from git "https://github.com/nathanial/raster" @ "v0.0.5"
+require reactive from git "https://github.com/nathanial/reactive" @ "v0.2.2"
+require crucible from git "https://github.com/nathanial/crucible" @ "v0.0.10"
 
 -- curl link args (inherited from wisp for HTTP client)
 def curlLinkArgs : Array String :=
